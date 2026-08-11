@@ -1,0 +1,101 @@
+@import 'tailwindcss';
+
+/* Palette flips at the token level so components never reference a raw hex.
+   Three states matter: explicit light, explicit dark, and the unstamped
+   default where only prefers-color-scheme decides. */
+:root {
+  --c-ground: #eaedf1;
+  --c-surface: #fbfcfd;
+  --c-sunken: #dfe3e9;
+  --c-ink: #171b22;
+  --c-muted: #5a6273;
+  --c-faint: #838b99;
+  --c-rule: #c5cbd4;
+  --c-hair: #d8dde4;
+  --c-accent: #9c5f04;
+  --c-accent-soft: #f2e4cc;
+  --c-danger: #a6332a;
+  --c-prio-1: #3e8ca0;
+  --c-prio-2: #9c5f04;
+  --c-prio-3: #a6332a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --c-ground: #13161b;
+    --c-surface: #1b1f27;
+    --c-sunken: #0e1116;
+    --c-ink: #e2e6ec;
+    --c-muted: #98a0ae;
+    --c-faint: #79818f;
+    --c-rule: #333a45;
+    --c-hair: #262c35;
+    --c-accent: #e4a13e;
+    --c-accent-soft: #2e2413;
+    --c-danger: #e8776a;
+    --c-prio-1: #5fb6cb;
+    --c-prio-2: #e4a13e;
+    --c-prio-3: #e8776a;
+  }
+}
+
+:root[data-theme='dark'] {
+  --c-ground: #13161b;
+  --c-surface: #1b1f27;
+  --c-sunken: #0e1116;
+  --c-ink: #e2e6ec;
+  --c-muted: #98a0ae;
+  --c-faint: #79818f;
+  --c-rule: #333a45;
+  --c-hair: #262c35;
+  --c-accent: #e4a13e;
+  --c-accent-soft: #2e2413;
+  --c-danger: #e8776a;
+  --c-prio-1: #5fb6cb;
+  --c-prio-2: #e4a13e;
+  --c-prio-3: #e8776a;
+}
+
+@theme inline {
+  --color-ground: var(--c-ground);
+  --color-surface: var(--c-surface);
+  --color-sunken: var(--c-sunken);
+  --color-ink: var(--c-ink);
+  --color-muted: var(--c-muted);
+  --color-faint: var(--c-faint);
+  --color-rule: var(--c-rule);
+  --color-hair: var(--c-hair);
+  --color-accent: var(--c-accent);
+  --color-accent-soft: var(--c-accent-soft);
+  --color-danger: var(--c-danger);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--c-ground);
+  color: var(--c-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
