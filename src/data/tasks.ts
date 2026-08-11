@@ -1,12 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
-import type { Task, TaskInsert, TaskPatch } from '@/lib/types'
+import { TASKS_TABLE, type Task, type TaskInsert, type TaskPatch } from '@/lib/types'
 
 export const TASKS_KEY = ['tasks'] as const
 
 async function fetchTasks(): Promise<Task[]> {
   const { data, error } = await supabase
-    .from('tasks')
+    .from(TASKS_TABLE)
     .select('*')
     .is('deleted_at', null)
     .order('created_at', { ascending: false })
@@ -23,7 +23,7 @@ export function useCreateTask() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (input: TaskInsert): Promise<Task> => {
-      const { data, error } = await supabase.from('tasks').insert(input).select().single()
+      const { data, error } = await supabase.from(TASKS_TABLE).insert(input).select().single()
       if (error) throw error
       return data
     },
@@ -35,7 +35,7 @@ export function useUpdateTask() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, patch }: { id: string; patch: TaskPatch }): Promise<Task> => {
-      const { data, error } = await supabase.from('tasks').update(patch).eq('id', id).select().single()
+      const { data, error } = await supabase.from(TASKS_TABLE).update(patch).eq('id', id).select().single()
       if (error) throw error
       return data
     },
@@ -60,7 +60,7 @@ export function useDeleteTask() {
   return useMutation({
     mutationFn: async (id: string): Promise<void> => {
       const { error } = await supabase
-        .from('tasks')
+        .from(TASKS_TABLE)
         .update({ deleted_at: new Date().toISOString() })
         .eq('id', id)
       if (error) throw error

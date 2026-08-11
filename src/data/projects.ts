@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
-import type { Project, ProjectInsert, ProjectPatch } from '@/lib/types'
+import { PROJECTS_TABLE, type Project, type ProjectInsert, type ProjectPatch } from '@/lib/types'
 
 export const PROJECTS_KEY = ['projects'] as const
 
@@ -12,7 +12,7 @@ export function nextColor(count: number): string {
 
 async function fetchProjects(): Promise<Project[]> {
   const { data, error } = await supabase
-    .from('projects')
+    .from(PROJECTS_TABLE)
     .select('*')
     .is('archived_at', null)
     .order('sort_order', { ascending: true })
@@ -29,7 +29,7 @@ export function useCreateProject() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (input: ProjectInsert): Promise<Project> => {
-      const { data, error } = await supabase.from('projects').insert(input).select().single()
+      const { data, error } = await supabase.from(PROJECTS_TABLE).insert(input).select().single()
       if (error) throw error
       return data
     },
@@ -41,7 +41,7 @@ export function useUpdateProject() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, patch }: { id: string; patch: ProjectPatch }): Promise<Project> => {
-      const { data, error } = await supabase.from('projects').update(patch).eq('id', id).select().single()
+      const { data, error } = await supabase.from(PROJECTS_TABLE).update(patch).eq('id', id).select().single()
       if (error) throw error
       return data
     },

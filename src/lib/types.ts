@@ -49,12 +49,18 @@ export type TaskPatch = Partial<Omit<Task, ServerManaged>>
 export type ProjectInsert = Partial<Omit<Project, ServerManaged>> & Pick<Project, 'name'>
 export type ProjectPatch = Partial<Omit<Project, ServerManaged>>
 
-/** The app owns the `planner` schema; `public` belongs to an unrelated system. */
+/**
+ * The `planner_` prefix is the namespace: this project's `public` schema is
+ * shared with an unrelated task manager that owns the unprefixed `tasks`.
+ */
+export const TASKS_TABLE = 'planner_tasks' as const
+export const PROJECTS_TABLE = 'planner_projects' as const
+
 export type Database = {
-  planner: {
+  public: {
     Tables: {
-      tasks: { Row: Task; Insert: TaskInsert; Update: TaskPatch; Relationships: [] }
-      projects: { Row: Project; Insert: ProjectInsert; Update: ProjectPatch; Relationships: [] }
+      planner_tasks: { Row: Task; Insert: TaskInsert; Update: TaskPatch; Relationships: [] }
+      planner_projects: { Row: Project; Insert: ProjectInsert; Update: ProjectPatch; Relationships: [] }
     }
     Views: { [_ in never]: never }
     Functions: { [_ in never]: never }
