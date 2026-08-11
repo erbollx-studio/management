@@ -49,8 +49,9 @@ export type TaskPatch = Partial<Omit<Task, ServerManaged>>
 export type ProjectInsert = Partial<Omit<Project, ServerManaged>> & Pick<Project, 'name'>
 export type ProjectPatch = Partial<Omit<Project, ServerManaged>>
 
+/** The app owns the `planner` schema; `public` belongs to an unrelated system. */
 export type Database = {
-  public: {
+  planner: {
     Tables: {
       tasks: { Row: Task; Insert: TaskInsert; Update: TaskPatch; Relationships: [] }
       projects: { Row: Project; Insert: ProjectInsert; Update: ProjectPatch; Relationships: [] }

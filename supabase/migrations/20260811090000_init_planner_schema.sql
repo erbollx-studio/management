@@ -1,16 +1,25 @@
 -- ============================================================================
 -- Phase 0 — projects and tasks
 --
--- Postgres is the source of truth for tasks (see docs/ARCHITECTURE.md §4).
--- Calendar columns are declared here but stay unused until phase 3, so that
--- the sync work does not have to rewrite the table it depends on.
+-- Everything lives in a dedicated `planner` schema rather than `public`.
+-- The target Supabase project already hosts an unrelated task manager in
+-- `public` (tasks, daily_log, task_templates, domains, settings) that is still
+-- needed, so the two systems are kept in separate namespaces and never collide.
+--
+-- Requires one dashboard step: Settings -> API -> Exposed schemas must include
+-- `planner`, otherwise PostgREST refuses requests against it.
+--
+-- Calendar columns are declared here but stay unused until phase 3, so that the
+-- sync work does not have to rewrite the table it depends on.
 -- ============================================================================
 
 create extension if not exists pgcrypto;
 
+create schema if not exists planner;
+
 -- ---------------------------------------------------------------- helpers --
 
-create or replace function public.set_updated_at()
+create or replace function planner.set_updated_at()
 returns trigger
 language plpgsql
 security invoker
@@ -26,7 +35,7 @@ $$;
 -- compares it against Google's `updated` field, so it must move only when a
 -- user-meaningful field changes -- never on bookkeeping writes such as storing
 -- an etag, or every sync would look like a local edit.
-create or replace function public.bump_local_updated_at()
+create or replace function planner.bump_local_updated_at()
 returns trigger
 language plpgsql
 security invoker
@@ -47,7 +56,7 @@ $$;
 
 -- --------------------------------------------------------------- projects --
 
-create table public.projects (
+create table planner.projects (
   id          uuid primary key default gen_random_uuid(),
   user_id     uuid not null default auth.uid() references auth.users (id) on delete cascade,
   name        text not null check (length(btrim(name)) between 1 and 120),
@@ -58,19 +67,19 @@ create table public.projects (
   updated_at  timestamptz not null default now()
 );
 
-create index projects_user_idx on public.projects (user_id, sort_order)
+create index projects_user_idx on planner.projects (user_id, sort_order)
   where archived_at is null;
 
 create trigger projects_set_updated_at
-  before update on public.projects
-  for each row execute function public.set_updated_at();
+  before update on planner.projects
+  for each row execute function planner.set_updated_at();
 
 -- ------------------------------------------------------------------ tasks --
 
-create table public.tasks (
+create table planner.tasks (
   id               uuid primary key default gen_random_uuid(),
   user_id          uuid not null default auth.uid() references auth.users (id) on delete cascade,
-  project_id       uuid references public.projects (id) on delete set null,
+  project_id       uuid references planner.projects (id) on delete set null,
 
   title            text not null check (length(btrim(title)) between 1 and 500),
   notes            text,
@@ -104,48 +113,50 @@ create table public.tasks (
 
 -- One Google event maps to at most one task. Partial so unscheduled tasks,
 -- which all carry null, do not collide.
-create unique index tasks_gcal_event_idx on public.tasks (gcal_event_id)
+create unique index tasks_gcal_event_idx on planner.tasks (gcal_event_id)
   where gcal_event_id is not null;
 
-create index tasks_user_status_idx  on public.tasks (user_id, status)          where deleted_at is null;
-create index tasks_user_due_idx     on public.tasks (user_id, due_at)          where deleted_at is null and status <> 'done';
-create index tasks_user_sched_idx   on public.tasks (user_id, scheduled_start) where deleted_at is null;
-create index tasks_project_idx      on public.tasks (project_id)               where deleted_at is null;
+create index tasks_user_status_idx on planner.tasks (user_id, status)          where deleted_at is null;
+create index tasks_user_due_idx    on planner.tasks (user_id, due_at)          where deleted_at is null and status <> 'done';
+create index tasks_user_sched_idx  on planner.tasks (user_id, scheduled_start) where deleted_at is null;
+create index tasks_project_idx     on planner.tasks (project_id)               where deleted_at is null;
 
 create trigger tasks_set_updated_at
-  before update on public.tasks
-  for each row execute function public.set_updated_at();
+  before update on planner.tasks
+  for each row execute function planner.set_updated_at();
 
 create trigger tasks_bump_local_updated_at
-  before update on public.tasks
-  for each row execute function public.bump_local_updated_at();
+  before update on planner.tasks
+  for each row execute function planner.bump_local_updated_at();
 
 -- -------------------------------------------------------------------- RLS --
 
-alter table public.projects enable row level security;
-alter table public.tasks    enable row level security;
+alter table planner.projects enable row level security;
+alter table planner.tasks    enable row level security;
 
 -- auth.uid() is wrapped in a scalar subquery so the planner evaluates it once
 -- per statement rather than once per row.
-create policy projects_select on public.projects
+create policy projects_select on planner.projects
   for select to authenticated using ((select auth.uid()) = user_id);
-create policy projects_insert on public.projects
+create policy projects_insert on planner.projects
   for insert to authenticated with check ((select auth.uid()) = user_id);
-create policy projects_update on public.projects
+create policy projects_update on planner.projects
   for update to authenticated using ((select auth.uid()) = user_id)
                                 with check ((select auth.uid()) = user_id);
-create policy projects_delete on public.projects
+create policy projects_delete on planner.projects
   for delete to authenticated using ((select auth.uid()) = user_id);
 
-create policy tasks_select on public.tasks
+create policy tasks_select on planner.tasks
   for select to authenticated using ((select auth.uid()) = user_id);
-create policy tasks_insert on public.tasks
+create policy tasks_insert on planner.tasks
   for insert to authenticated with check ((select auth.uid()) = user_id);
-create policy tasks_update on public.tasks
+create policy tasks_update on planner.tasks
   for update to authenticated using ((select auth.uid()) = user_id)
                              with check ((select auth.uid()) = user_id);
-create policy tasks_delete on public.tasks
+create policy tasks_delete on planner.tasks
   for delete to authenticated using ((select auth.uid()) = user_id);
 
-grant select, insert, update, delete on public.projects to authenticated;
-grant select, insert, update, delete on public.tasks    to authenticated;
+-- Only signed-in users reach this schema; anon is deliberately left out.
+grant usage on schema planner to authenticated;
+grant select, insert, update, delete on planner.projects to authenticated;
+grant select, insert, update, delete on planner.tasks    to authenticated;
