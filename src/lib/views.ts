@@ -8,6 +8,7 @@ export type View =
   | { kind: 'all' }
   | { kind: 'done' }
   | { kind: 'project'; id: string }
+  | { kind: 'calendar' }
 
 export function viewKey(view: View): string {
   return view.kind === 'project' ? `project:${view.id}` : view.kind
@@ -37,6 +38,9 @@ export function filterTasks(tasks: Task[], view: View, now = new Date()): Task[]
       return tasks.filter((t) => t.status === 'done')
     case 'project':
       return tasks.filter((t) => isActive(t) && t.project_id === view.id)
+    case 'calendar':
+      // Not a task list — App renders the connection panel for this view.
+      return []
   }
 }
 

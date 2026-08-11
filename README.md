@@ -11,8 +11,10 @@ week one.
 
 ## Status
 
-Phase 0 complete: schema, RLS, auth and task CRUD. No calendar integration yet
-— see the build order in the architecture doc.
+Phase 0 complete: schema, RLS, auth and task CRUD.
+Phase 1 complete in code: OAuth handshake, token custody, calendar listing —
+pending the Google Cloud setup below before it can run. Nothing writes to
+Google Calendar yet; see the build order in the architecture doc.
 
 ## Stack
 
@@ -50,6 +52,57 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 ```
 
 `401` is correct — anonymous callers are refused, signed-in ones are not.
+
+## Connecting Google Calendar
+
+The `google-calendar` Edge Function runs the whole handshake — consent, token
+exchange, refresh, calendar listing. It needs an OAuth client in Google Cloud
+and three secrets in Supabase.
+
+### 1. Google Cloud Console
+
+- APIs & Services → **enable the Google Calendar API**
+- OAuth consent screen → External → **Publish to Production**
+
+  Not optional, and worth doing before anything else. A project left in
+  *Testing* issues refresh tokens that **expire after 7 days**, and the
+  resulting `invalid_grant` reads like a code bug. Publishing without
+  verification is fine: you click through an "unverified app" warning once and
+  accept a 100-user cap. See [ARCHITECTURE §6](docs/ARCHITECTURE.md).
+
+- Credentials → OAuth client ID → **Web application**
+- Authorised redirect URI, exactly:
+
+  ```
+  https://<project-ref>.supabase.co/functions/v1/google-calendar/callback
+  ```
+
+### 2. Supabase → Edge Functions → Secrets
+
+| Secret | Value |
+|---|---|
+| `GOOGLE_CLIENT_ID` | from the OAuth client |
+| `GOOGLE_CLIENT_SECRET` | from the OAuth client |
+| `APP_URL` | where to return after consent — `http://localhost:5173` in dev, the Netlify URL in production |
+
+`SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are
+injected automatically.
+
+### 3. Connect
+
+Open the app → **Календарь** → connect. Google returns to `APP_URL` with the
+outcome in the query string, and the panel reports it.
+
+### Where the token lives
+
+The refresh token goes into **Supabase Vault**, reachable only through two
+`SECURITY DEFINER` functions granted to `service_role`. The access token is
+cached in `planner_google_tokens`, which has RLS on and no grants at all. The
+browser can read connection status from `planner_google_accounts` and nothing
+else.
+
+`planner_oauth_states` holds in-flight handshakes with a PKCE verifier; each
+state is single-use and expires after 10 minutes.
 
 ## Scripts
 

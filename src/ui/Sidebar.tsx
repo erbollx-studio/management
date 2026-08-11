@@ -60,6 +60,22 @@ export function Sidebar({ current, onSelect, tasks }: Props) {
         })}
       </ul>
 
+      <ul className="flex flex-col">
+        <li>
+          <button
+            type="button"
+            onClick={() => onSelect({ kind: 'calendar' })}
+            aria-current={activeKey === 'calendar' ? 'page' : undefined}
+            className={cx(
+              'w-full px-2.5 py-1.5 text-left text-sm transition-colors',
+              activeKey === 'calendar' ? 'bg-sunken font-medium text-ink' : 'text-muted hover:text-ink',
+            )}
+          >
+            Календарь
+          </button>
+        </li>
+      </ul>
+
       <div className="flex flex-col gap-1">
         <div className="flex items-center justify-between px-2.5">
           <h2 className="font-mono text-[0.65rem] tracking-[0.14em] text-faint uppercase">Проекты</h2>

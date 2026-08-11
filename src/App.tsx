@@ -5,10 +5,29 @@ import { useProjects } from '@/data/projects'
 import { useTasks } from '@/data/tasks'
 import { isConfigured } from '@/lib/supabase'
 import { filterTasks, sortTasks, type View } from '@/lib/views'
+import { CalendarPanel } from '@/ui/CalendarPanel'
 import { QuickAdd } from '@/ui/QuickAdd'
 import { Sidebar } from '@/ui/Sidebar'
 import { TaskList } from '@/ui/TaskList'
 import { useTheme } from '@/ui/useTheme'
+
+/**
+ * The OAuth callback lands back on the app with ?calendar=connected|error.
+ * Read once at startup, then strip from the URL so a refresh does not replay
+ * a stale banner.
+ */
+function readCallbackParams(): { status: string | null; detail: string | null } {
+  const params = new URLSearchParams(window.location.search)
+  const status = params.get('calendar')
+  const detail = params.get('detail')
+  if (status) {
+    params.delete('calendar')
+    params.delete('detail')
+    const query = params.toString()
+    window.history.replaceState({}, '', window.location.pathname + (query ? `?${query}` : ''))
+  }
+  return { status, detail }
+}
 
 const THEME_LABEL = { system: 'Авто', light: 'Светлая', dark: 'Тёмная' } as const
 
@@ -23,7 +42,9 @@ export function App() {
 
 function Workspace() {
   const { session, signOut } = useAuth()
-  const [view, setView] = useState<View>({ kind: 'today' })
+  const [callback, setCallback] = useState(readCallbackParams)
+  // Returning from Google should land on the panel that explains what happened.
+  const [view, setView] = useState<View>(callback.status ? { kind: 'calendar' } : { kind: 'today' })
   const [theme, cycleTheme] = useTheme()
 
   const { data: tasks = [], isLoading, error } = useTasks()
@@ -34,7 +55,14 @@ function Workspace() {
   const title =
     view.kind === 'project'
       ? (projects.find((p) => p.id === view.id)?.name ?? 'Проект')
-      : { today: 'Сегодня', upcoming: 'Предстоящие', inbox: 'Входящие', all: 'Все', done: 'Выполненные' }[view.kind]
+      : {
+          today: 'Сегодня',
+          upcoming: 'Предстоящие',
+          inbox: 'Входящие',
+          all: 'Все',
+          done: 'Выполненные',
+          calendar: 'Календарь',
+        }[view.kind]
 
   const empty =
     view.kind === 'today'
@@ -68,21 +96,33 @@ function Workspace() {
         <main className="flex min-w-0 flex-1 flex-col gap-4">
           <div className="flex items-baseline justify-between gap-3">
             <h1 className="font-mono text-xl font-semibold tracking-tight">{title}</h1>
-            <span className="font-mono text-[0.68rem] text-faint tabular-nums">{visible.length}</span>
+            {view.kind !== 'calendar' && (
+              <span className="font-mono text-[0.68rem] text-faint tabular-nums">{visible.length}</span>
+            )}
           </div>
 
-          {view.kind !== 'done' && <QuickAdd view={view} />}
-
-          {error && (
-            <p className="border border-danger px-3 py-2 text-sm text-danger">
-              Не удалось загрузить задачи: {error.message}
-            </p>
-          )}
-
-          {isLoading ? (
-            <p className="text-sm text-faint">Загрузка задач…</p>
+          {view.kind === 'calendar' ? (
+            <CalendarPanel
+              callbackStatus={callback.status}
+              callbackDetail={callback.detail}
+              onDismissCallback={() => setCallback({ status: null, detail: null })}
+            />
           ) : (
-            <TaskList tasks={visible} projects={projects} emptyMessage={empty} />
+            <>
+              {view.kind !== 'done' && <QuickAdd view={view} />}
+
+              {error && (
+                <p className="border border-danger px-3 py-2 text-sm text-danger">
+                  Не удалось загрузить задачи: {error.message}
+                </p>
+              )}
+
+              {isLoading ? (
+                <p className="text-sm text-faint">Загрузка задач…</p>
+              ) : (
+                <TaskList tasks={visible} projects={projects} emptyMessage={empty} />
+              )}
+            </>
           )}
         </main>
       </div>

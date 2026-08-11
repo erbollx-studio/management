@@ -55,12 +55,37 @@ export type ProjectPatch = Partial<Omit<Project, ServerManaged>>
  */
 export const TASKS_TABLE = 'planner_tasks' as const
 export const PROJECTS_TABLE = 'planner_projects' as const
+export const GOOGLE_ACCOUNTS_TABLE = 'planner_google_accounts' as const
+
+export type GoogleConnectionStatus = 'connected' | 'needs_reauth' | 'revoked'
+
+/**
+ * Connection metadata only. The refresh token lives in Vault and the access
+ * token in a table the client holds no grant on — neither is reachable here.
+ */
+export type GoogleAccount = {
+  user_id: string
+  google_sub: string
+  email: string | null
+  scopes: string
+  status: GoogleConnectionStatus
+  connected_at: string
+  last_health_check_at: string | null
+  last_error: string | null
+  updated_at: string
+}
 
 export type Database = {
   public: {
     Tables: {
       planner_tasks: { Row: Task; Insert: TaskInsert; Update: TaskPatch; Relationships: [] }
       planner_projects: { Row: Project; Insert: ProjectInsert; Update: ProjectPatch; Relationships: [] }
+      planner_google_accounts: {
+        Row: GoogleAccount
+        Insert: Partial<GoogleAccount>
+        Update: Partial<GoogleAccount>
+        Relationships: []
+      }
     }
     Views: { [_ in never]: never }
     Functions: { [_ in never]: never }
