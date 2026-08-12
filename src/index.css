@@ -91,6 +91,67 @@ body {
   outline-offset: 2px;
 }
 
+.calendar-shell {
+  --fc-page-bg-color: var(--c-surface);
+  --fc-border-color: var(--c-hair);
+  --fc-neutral-bg-color: var(--c-sunken);
+  --fc-neutral-text-color: var(--c-muted);
+  --fc-button-bg-color: var(--c-surface);
+  --fc-button-border-color: var(--c-rule);
+  --fc-button-text-color: var(--c-ink);
+  --fc-button-hover-bg-color: var(--c-sunken);
+  --fc-button-hover-border-color: var(--c-rule);
+  --fc-button-active-bg-color: var(--c-ink);
+  --fc-button-active-border-color: var(--c-ink);
+  --fc-today-bg-color: var(--c-accent-soft);
+  --fc-now-indicator-color: var(--c-danger);
+  --fc-event-text-color: var(--c-surface);
+  padding: 0.75rem;
+}
+
+.calendar-shell .fc {
+  font-size: 0.82rem;
+}
+
+.calendar-shell .fc .fc-toolbar-title {
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.calendar-shell .fc .fc-button {
+  border-radius: 0;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.6rem;
+  text-transform: none;
+}
+
+.calendar-shell .fc .fc-button:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.calendar-shell .fc .fc-button-active {
+  color: var(--c-surface);
+}
+
+.calendar-shell .fc .fc-event {
+  border-radius: 0;
+  font-size: 0.72rem;
+}
+
+.calendar-shell .fc .fc-timegrid-slot {
+  height: 2.2rem;
+}
+
+.calendar-shell .fc .fc-col-header-cell-cushion,
+.calendar-shell .fc .fc-timegrid-slot-label-cushion {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--c-muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

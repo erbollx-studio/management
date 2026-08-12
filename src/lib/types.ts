@@ -56,6 +56,7 @@ export type ProjectPatch = Partial<Omit<Project, ServerManaged>>
 export const TASKS_TABLE = 'planner_tasks' as const
 export const PROJECTS_TABLE = 'planner_projects' as const
 export const GOOGLE_ACCOUNTS_TABLE = 'planner_google_accounts' as const
+export const CALENDAR_EVENTS_TABLE = 'planner_calendar_events' as const
 
 export type GoogleConnectionStatus = 'connected' | 'needs_reauth' | 'revoked'
 
@@ -75,6 +76,24 @@ export type GoogleAccount = {
   updated_at: string
 }
 
+/** Read-only mirror row of a Google Calendar event; written only by the sync worker. */
+export type CalendarEvent = {
+  user_id: string
+  gcal_event_id: string
+  calendar_id: string
+  etag: string | null
+  summary: string | null
+  start_at: string | null
+  end_at: string | null
+  is_all_day: boolean
+  status: string
+  html_link: string | null
+  remote_updated_at: string | null
+  owned_by_app: boolean
+  raw: Record<string, unknown> | null
+  synced_at: string
+}
+
 export type Database = {
   public: {
     Tables: {
@@ -84,6 +103,12 @@ export type Database = {
         Row: GoogleAccount
         Insert: Partial<GoogleAccount>
         Update: Partial<GoogleAccount>
+        Relationships: []
+      }
+      planner_calendar_events: {
+        Row: CalendarEvent
+        Insert: Partial<CalendarEvent>
+        Update: Partial<CalendarEvent>
         Relationships: []
       }
     }

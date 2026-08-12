@@ -31,6 +31,12 @@ const SCOPES = [
 const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth'
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
 const CALENDAR_LIST = 'https://www.googleapis.com/calendar/v3/users/me/calendarList'
+const EVENTS = (calendarId: string) =>
+  `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`
+
+/** How far back a full resync reaches. Google keeps the same filter for every
+ *  subsequent syncToken request, so this is chosen once and then inherited. */
+const FULL_SYNC_LOOKBACK_DAYS = 30
 
 /** Refresh this early so a request never races the expiry it just checked. */
 const EXPIRY_MARGIN_SECONDS = 60
@@ -321,6 +327,180 @@ async function handleCalendars(req: Request): Promise<Response> {
   return json({ calendars })
 }
 
+interface GoogleEvent {
+  id: string
+  etag?: string
+  status?: string
+  summary?: string
+  htmlLink?: string
+  updated?: string
+  start?: { date?: string; dateTime?: string }
+  end?: { date?: string; dateTime?: string }
+  extendedProperties?: { private?: Record<string, string> }
+}
+
+/**
+ * An all-day event carries `date` rather than `dateTime`. It is stored as the
+ * plain calendar date at UTC midnight and flagged, never run through a
+ * timezone conversion -- that is the classic off-by-one-day bug.
+ */
+function eventBounds(e: GoogleEvent): { start: string | null; end: string | null; allDay: boolean } {
+  const allDay = Boolean(e.start?.date)
+  const start = e.start?.dateTime ?? (e.start?.date ? `${e.start.date}T00:00:00Z` : null)
+  const end = e.end?.dateTime ?? (e.end?.date ? `${e.end.date}T00:00:00Z` : null)
+  return { start, end, allDay }
+}
+
+/**
+ * Incremental pull. Three things make this survivable rather than merely
+ * working: showDeleted so cancellations arrive at all, a 410 handler because
+ * Google expires sync tokens as normal operation, and a sync_runs row written
+ * either way so a silent failure still leaves a trace.
+ */
+async function runSync(db: SupabaseClient, userId: string): Promise<Record<string, unknown>> {
+  const { data: run } = await db
+    .from('planner_sync_runs')
+    .insert({ user_id: userId, kind: 'poll' })
+    .select('id')
+    .single()
+
+  const finish = async (ok: boolean, changed: number, error?: string) => {
+    if (run?.id) {
+      await db
+        .from('planner_sync_runs')
+        .update({ finished_at: new Date().toISOString(), ok, changed_count: changed, error: error ?? null })
+        .eq('id', run.id)
+    }
+  }
+
+  try {
+    const accessToken = await getAccessToken(db, userId)
+
+    let { data: state } = await db
+      .from('planner_sync_state')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (!state) {
+      const inserted = await db
+        .from('planner_sync_state')
+        .insert({ user_id: userId, calendar_id: 'primary' })
+        .select('*')
+        .single()
+      state = inserted.data
+    }
+
+    const calendarId: string = state?.calendar_id ?? 'primary'
+    let syncToken: string | null = state?.sync_token ?? null
+    let wasFull = !syncToken
+    let pageToken: string | null = null
+    let changed = 0
+    let nextSyncToken: string | null = null
+
+    for (let page = 0; page < 40; page++) {
+      const params = new URLSearchParams({
+        singleEvents: 'true',
+        showDeleted: 'true',
+        maxResults: '250',
+      })
+      if (syncToken) params.set('syncToken', syncToken)
+      else {
+        const since = new Date(Date.now() - FULL_SYNC_LOOKBACK_DAYS * 86_400_000)
+        params.set('timeMin', since.toISOString())
+      }
+      if (pageToken) params.set('pageToken', pageToken)
+
+      const res = await fetch(`${EVENTS(calendarId)}?${params}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
+
+      // 410 is routine, not an outage: the cursor aged out and the only cure
+      // is a full resync. Restart the loop once with the token cleared.
+      if (res.status === 410 && syncToken) {
+        await db.from('planner_sync_state').update({ sync_token: null }).eq('user_id', userId)
+        syncToken = null
+        pageToken = null
+        wasFull = true
+        continue
+      }
+
+      if (!res.ok) throw new Error(`calendar_list_failed_${res.status}`)
+
+      const body = (await res.json()) as {
+        items?: GoogleEvent[]
+        nextPageToken?: string
+        nextSyncToken?: string
+      }
+
+      const rows = (body.items ?? []).map((e) => {
+        const { start, end, allDay } = eventBounds(e)
+        return {
+          user_id: userId,
+          gcal_event_id: e.id,
+          calendar_id: calendarId,
+          etag: e.etag ?? null,
+          summary: e.summary ?? null,
+          start_at: start,
+          end_at: end,
+          is_all_day: allDay,
+          status: e.status ?? 'confirmed',
+          html_link: e.htmlLink ?? null,
+          remote_updated_at: e.updated ?? null,
+          owned_by_app: Boolean(e.extendedProperties?.private?.plannerTaskId),
+          raw: e as unknown as Record<string, unknown>,
+          synced_at: new Date().toISOString(),
+        }
+      })
+
+      if (rows.length) {
+        const { error } = await db
+          .from('planner_calendar_events')
+          .upsert(rows, { onConflict: 'user_id,gcal_event_id' })
+        if (error) throw new Error(`shadow_write_failed: ${error.message}`)
+        changed += rows.length
+      }
+
+      pageToken = body.nextPageToken ?? null
+      if (body.nextSyncToken) nextSyncToken = body.nextSyncToken
+      if (!pageToken) break
+    }
+
+    const stamp = new Date().toISOString()
+    await db
+      .from('planner_sync_state')
+      .update({
+        sync_token: nextSyncToken,
+        last_incremental_at: stamp,
+        ...(wasFull ? { last_full_sync_at: stamp } : {}),
+        consecutive_failures: 0,
+      })
+      .eq('user_id', userId)
+
+    await finish(true, changed)
+    return { ok: true, full: wasFull, changed }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'unknown'
+    await db.rpc('planner_bump_sync_failure', { p_user_id: userId }).then(
+      () => undefined,
+      () => undefined,
+    )
+    await finish(false, 0, message)
+    throw e
+  }
+}
+
+async function handleSync(req: Request): Promise<Response> {
+  const user = await requireUser(req)
+  if (!user) return json({ error: 'unauthorized' }, 401)
+  try {
+    return json(await runSync(admin(), user.id))
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : 'unknown'
+    return json({ error: reason }, reason === 'not_connected' ? 404 : 502)
+  }
+}
+
 async function handleDisconnect(req: Request): Promise<Response> {
   const user = await requireUser(req)
   if (!user) return json({ error: 'unauthorized' }, 401)
@@ -359,6 +539,8 @@ Deno.serve(async (req) => {
         return await handleCallback(req)
       case 'calendars':
         return await handleCalendars(req)
+      case 'sync':
+        return await handleSync(req)
       case 'disconnect':
         return await handleDisconnect(req)
       default:

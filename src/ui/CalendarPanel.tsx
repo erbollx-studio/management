@@ -1,5 +1,12 @@
+import { lazy, Suspense } from 'react'
 import { useCalendars, useConnectGoogle, useDisconnectGoogle, useGoogleAccount } from '@/data/calendar'
 import { cx } from '@/lib/cx'
+
+// FullCalendar is ~200 KB minified; keep it out of the main bundle so the
+// task views load without it.
+const CalendarGrid = lazy(() =>
+  import('./CalendarGrid').then((m) => ({ default: m.CalendarGrid })),
+)
 
 /** Callback failures come back as ?calendar=error&detail=… on the app URL. */
 const CALLBACK_DETAIL: Record<string, string> = {
@@ -118,6 +125,10 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
           </div>
         </div>
       )}
+
+      <Suspense fallback={<p className="text-sm text-faint">Загружаем сетку…</p>}>
+        <CalendarGrid connected={connected} />
+      </Suspense>
     </div>
   )
 }
