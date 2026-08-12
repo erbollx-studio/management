@@ -9,6 +9,8 @@ Google Calendar event; moving that event in Google Calendar updates the task.
 model, and the Google OAuth setting that decides whether this survives past
 week one.
 
+**Live:** https://management-erbol.netlify.app
+
 ## Status
 
 Phase 0 complete: schema, RLS, auth and task CRUD.
@@ -83,7 +85,7 @@ and three secrets in Supabase.
 |---|---|
 | `GOOGLE_CLIENT_ID` | from the OAuth client |
 | `GOOGLE_CLIENT_SECRET` | from the OAuth client |
-| `APP_URL` | where to return after consent — `http://localhost:5173` in dev, the Netlify URL in production |
+| `APP_URL` | where to return after consent — `https://management-erbol.netlify.app` |
 
 `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are
 injected automatically.
