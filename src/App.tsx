@@ -9,6 +9,8 @@ import { CalendarPanel } from '@/ui/CalendarPanel'
 import { QuickAdd } from '@/ui/QuickAdd'
 import { Sidebar } from '@/ui/Sidebar'
 import { TaskList } from '@/ui/TaskList'
+import { MoreSheet } from '@/ui/shell/MoreSheet'
+import { TabBar } from '@/ui/shell/TabBar'
 import { useTheme } from '@/ui/useTheme'
 
 /**
@@ -46,6 +48,8 @@ function Workspace() {
   // Returning from Google should land on the panel that explains what happened.
   const [view, setView] = useState<View>(callback.status ? { kind: 'calendar' } : { kind: 'today' })
   const [theme, cycleTheme] = useTheme()
+  // Mobile-only «Ещё» bottom sheet; desktop navigation lives in the sidebar.
+  const [moreOpen, setMoreOpen] = useState(false)
 
   const { data: tasks = [], isLoading, error } = useTasks()
   const { data: projects = [] } = useProjects()
@@ -71,9 +75,30 @@ function Workspace() {
         ? 'Пока ничего не выполнено.'
         : 'Пусто. Добавьте первую задачу.'
 
+  // Shared task-list rendering: every non-calendar view shows QuickAdd (except
+  // done) plus the filtered list. Kept as one expression so the today branch
+  // below can swap to a dedicated TodayView with a one-line change.
+  const taskListContent = (
+    <>
+      {view.kind !== 'done' && <QuickAdd view={view} />}
+
+      {error && (
+        <p className="rounded-control border border-danger/50 bg-surface px-3 py-2 text-sm text-danger">
+          Не удалось загрузить задачи: {error.message}
+        </p>
+      )}
+
+      {isLoading ? (
+        <p className="text-sm text-faint">Загрузка задач…</p>
+      ) : (
+        <TaskList tasks={visible} projects={projects} emptyMessage={empty} />
+      )}
+    </>
+  )
+
   return (
     <div className="mx-auto flex min-h-full max-w-5xl flex-col px-4 sm:px-6">
-      <header className="flex items-center justify-between gap-4 border-b border-hair py-4">
+      <header className="flex items-center justify-between gap-4 border-b border-hair py-3 sm:py-4">
         <span className="font-mono text-[0.7rem] tracking-[0.16em] text-muted uppercase">Management</span>
         <div className="flex items-center gap-3 font-mono text-[0.68rem] text-muted">
           <button type="button" onClick={cycleTheme} className="hover:text-ink" aria-label="Сменить тему">
@@ -88,8 +113,9 @@ function Workspace() {
         </div>
       </header>
 
-      <div className="flex flex-1 flex-col gap-6 py-6 sm:flex-row sm:gap-8">
-        <aside className="sm:w-52 sm:shrink-0">
+      {/* Bottom padding on mobile keeps content clear of the fixed tab bar. */}
+      <div className="flex flex-1 flex-col gap-6 pt-6 pb-[calc(4.5rem+env(safe-area-inset-bottom))] sm:flex-row sm:gap-8 sm:pb-6">
+        <aside className="hidden sm:block sm:w-52 sm:shrink-0">
           <Sidebar current={view} onSelect={setView} tasks={tasks} />
         </aside>
 
@@ -108,25 +134,18 @@ function Workspace() {
               onDismissCallback={() => setCallback({ status: null, detail: null })}
               tasks={tasks}
             />
+          ) : view.kind === 'today' ? (
+            // TODAY-BRANCH SWAP POINT: replace this single expression with the
+            // dedicated <TodayView /> once it lands — nothing else changes.
+            taskListContent
           ) : (
-            <>
-              {view.kind !== 'done' && <QuickAdd view={view} />}
-
-              {error && (
-                <p className="rounded-control border border-danger/50 bg-surface px-3 py-2 text-sm text-danger">
-                  Не удалось загрузить задачи: {error.message}
-                </p>
-              )}
-
-              {isLoading ? (
-                <p className="text-sm text-faint">Загрузка задач…</p>
-              ) : (
-                <TaskList tasks={visible} projects={projects} emptyMessage={empty} />
-              )}
-            </>
+            taskListContent
           )}
         </main>
       </div>
+
+      <TabBar current={view} onSelect={setView} onMore={() => setMoreOpen(true)} moreOpen={moreOpen} />
+      {moreOpen && <MoreSheet current={view} onSelect={setView} onClose={() => setMoreOpen(false)} />}
     </div>
   )
 }
