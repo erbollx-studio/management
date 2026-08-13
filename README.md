@@ -13,10 +13,18 @@ week one.
 
 ## Status
 
-Phase 0 complete: schema, RLS, auth and task CRUD.
-Phase 1 complete in code: OAuth handshake, token custody, calendar listing —
-pending the Google Cloud setup below before it can run. Nothing writes to
-Google Calendar yet; see the build order in the architecture doc.
+All phases of the build order are live:
+
+- **0** — schema, RLS, auth, task CRUD
+- **1** — OAuth handshake, Vault token custody, calendar listing
+- **2** — read-only mirror + week grid
+- **3** — write path: drag a task onto the grid, a real event appears in Google
+- **4** — two-way: push webhook + 10-minute cron + echo suppression + conflict log
+- **5** — nightly reconcile + external GitHub Actions watchdog
+
+The sync durability model from the architecture doc is fully in place: push
+(seconds) → poll (10 min) → reconcile (nightly) → watchdog (hourly, external).
+The UI follows the Meridian design system from the design handoff.
 
 ## Stack
 
