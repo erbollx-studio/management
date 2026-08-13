@@ -1,16 +1,19 @@
 import { useMemo, useState } from 'react'
 import { useAuth } from '@/auth/AuthProvider'
 import { LoginPage } from '@/auth/LoginPage'
+import { useGoogleAccount } from '@/data/calendar'
 import { useProjects } from '@/data/projects'
 import { useTasks } from '@/data/tasks'
 import { isConfigured } from '@/lib/supabase'
 import { filterTasks, sortTasks, type View } from '@/lib/views'
 import { CalendarPanel } from '@/ui/CalendarPanel'
+import { CommandLayer } from '@/ui/CommandLayer'
 import { QuickAdd } from '@/ui/QuickAdd'
 import { Sidebar } from '@/ui/Sidebar'
 import { TaskList } from '@/ui/TaskList'
 import { MoreSheet } from '@/ui/shell/MoreSheet'
 import { TabBar } from '@/ui/shell/TabBar'
+import { TodayView } from '@/ui/today/TodayView'
 import { useTheme } from '@/ui/useTheme'
 
 /**
@@ -53,6 +56,8 @@ function Workspace() {
 
   const { data: tasks = [], isLoading, error } = useTasks()
   const { data: projects = [] } = useProjects()
+  const { data: googleAccount } = useGoogleAccount()
+  const connected = googleAccount?.status === 'connected'
 
   const visible = useMemo(() => sortTasks(filterTasks(tasks, view)), [tasks, view])
 
@@ -120,12 +125,15 @@ function Workspace() {
         </aside>
 
         <main className="flex min-w-0 flex-1 flex-col gap-4">
-          <div className="flex items-baseline justify-between gap-3">
-            <h1 className="font-serif text-2xl font-semibold tracking-tight">{title}</h1>
-            {view.kind !== 'calendar' && (
-              <span className="font-mono text-[0.68rem] text-faint tabular-nums">{visible.length}</span>
-            )}
-          </div>
+          {/* TodayView carries its own serif header with date and progress. */}
+          {view.kind !== 'today' && (
+            <div className="flex items-baseline justify-between gap-3">
+              <h1 className="font-serif text-2xl font-semibold tracking-tight">{title}</h1>
+              {view.kind !== 'calendar' && (
+                <span className="font-mono text-[0.68rem] text-faint tabular-nums">{visible.length}</span>
+              )}
+            </div>
+          )}
 
           {view.kind === 'calendar' ? (
             <CalendarPanel
@@ -135,9 +143,17 @@ function Workspace() {
               tasks={tasks}
             />
           ) : view.kind === 'today' ? (
-            // TODAY-BRANCH SWAP POINT: replace this single expression with the
-            // dedicated <TodayView /> once it lands — nothing else changes.
-            taskListContent
+            <>
+              {/* Quick capture stays on the command center so the `n` hotkey
+                  always has a target. */}
+              <QuickAdd view={view} />
+              <TodayView
+                tasks={tasks}
+                projects={projects}
+                connected={connected}
+                onOpenCalendar={() => setView({ kind: 'calendar' })}
+              />
+            </>
           ) : (
             taskListContent
           )}
@@ -146,6 +162,7 @@ function Workspace() {
 
       <TabBar current={view} onSelect={setView} onMore={() => setMoreOpen(true)} moreOpen={moreOpen} />
       {moreOpen && <MoreSheet current={view} onSelect={setView} onClose={() => setMoreOpen(false)} />}
+      <CommandLayer tasks={tasks} projects={projects} onNavigate={setView} />
     </div>
   )
 }

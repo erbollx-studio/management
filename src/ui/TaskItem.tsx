@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { cx } from '@/lib/cx'
 import { dateInputToDueAt, dueAtToDateInput, formatDueDate, formatEstimate, isOverdue } from '@/lib/dates'
+import { ScheduleDialog, formatSlot } from '@/ui/ScheduleDialog'
 import type { Priority, Project, Task, TaskPatch } from '@/lib/types'
 
 const PRIORITY_LABEL: Record<Priority, string> = {
@@ -27,6 +28,7 @@ interface Props {
 
 export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Props) {
   const [open, setOpen] = useState(false)
+  const [planOpen, setPlanOpen] = useState(false)
   const [title, setTitle] = useState(task.title)
 
   const done = task.status === 'done'
@@ -196,6 +198,21 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
             </select>
           </label>
 
+          <div className="sm:col-span-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPlanOpen(true)}
+              className="rounded-control border border-rule px-2.5 py-1 font-mono text-[0.7rem] transition-colors hover:border-accent"
+            >
+              {task.scheduled_start ? 'Перенести' : 'В календарь'}
+            </button>
+            {task.scheduled_start && (
+              <span className="font-mono text-[0.68rem] text-muted">
+                {formatSlot(task.scheduled_start, task.scheduled_end)}
+              </span>
+            )}
+          </div>
+
           <div className="sm:col-span-2 flex items-center justify-between border-t border-hair pt-3">
             <span className="font-mono text-[0.65rem] text-faint">
               создана {new Date(task.created_at).toLocaleDateString('ru')}
@@ -210,6 +227,8 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
           </div>
         </div>
       )}
+
+      {planOpen && <ScheduleDialog task={task} onClose={() => setPlanOpen(false)} />}
     </li>
   )
 }
