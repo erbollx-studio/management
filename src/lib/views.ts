@@ -9,6 +9,8 @@ export type View =
   | { kind: 'done' }
   | { kind: 'project'; id: string }
   | { kind: 'calendar' }
+  | { kind: 'recurring' }
+  | { kind: 'review' }
 
 export function viewKey(view: View): string {
   return view.kind === 'project' ? `project:${view.id}` : view.kind
@@ -39,7 +41,9 @@ export function filterTasks(tasks: Task[], view: View, now = new Date()): Task[]
     case 'project':
       return tasks.filter((t) => isActive(t) && t.project_id === view.id)
     case 'calendar':
-      // Not a task list — App renders the connection panel for this view.
+    case 'recurring':
+    case 'review':
+      // Not task lists — App renders dedicated panels for these views.
       return []
   }
 }

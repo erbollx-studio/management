@@ -71,6 +71,8 @@ function Workspace() {
           all: 'Все',
           done: 'Выполненные',
           calendar: 'Календарь',
+          recurring: 'Повторяющиеся',
+          review: 'Обзор',
         }[view.kind]
 
   const empty =

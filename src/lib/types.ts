@@ -7,6 +7,8 @@ export type Priority = 0 | 1 | 2 | 3
 // constrains table types to `Record<string, unknown>`, and interfaces do not
 // get an implicit index signature, so they fail that constraint.
 
+export type EnergyLevel = 'light' | 'heavy'
+
 export type Task = {
   id: string
   user_id: string
@@ -23,6 +25,8 @@ export type Task = {
   gcal_event_id: string | null
   gcal_etag: string | null
   sort_order: number
+  energy: EnergyLevel | null
+  template_id: string | null
   local_updated_at: string
   created_at: string
   updated_at: string
@@ -57,6 +61,7 @@ export const TASKS_TABLE = 'planner_tasks' as const
 export const PROJECTS_TABLE = 'planner_projects' as const
 export const GOOGLE_ACCOUNTS_TABLE = 'planner_google_accounts' as const
 export const CALENDAR_EVENTS_TABLE = 'planner_calendar_events' as const
+export const TEMPLATES_TABLE = 'planner_task_templates' as const
 
 export type GoogleConnectionStatus = 'connected' | 'needs_reauth' | 'revoked'
 
@@ -75,6 +80,27 @@ export type GoogleAccount = {
   last_error: string | null
   updated_at: string
 }
+
+/** Recurring template: generates one task per matching day at 00:05 UTC. */
+export type TaskTemplate = {
+  id: string
+  user_id: string
+  title: string
+  notes: string | null
+  project_id: string | null
+  priority: Priority
+  estimate_minutes: number | null
+  energy: EnergyLevel | null
+  repeat_rule: 'daily' | 'weekdays' | 'custom'
+  custom_days: number[] | null
+  due_time: string | null
+  active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export type TemplateInsert = Partial<Omit<TaskTemplate, ServerManaged>> & Pick<TaskTemplate, 'title'>
+export type TemplatePatch = Partial<Omit<TaskTemplate, ServerManaged>>
 
 /** Read-only mirror row of a Google Calendar event; written only by the sync worker. */
 export type CalendarEvent = {
@@ -109,6 +135,12 @@ export type Database = {
         Row: CalendarEvent
         Insert: Partial<CalendarEvent>
         Update: Partial<CalendarEvent>
+        Relationships: []
+      }
+      planner_task_templates: {
+        Row: TaskTemplate
+        Insert: TemplateInsert
+        Update: TemplatePatch
         Relationships: []
       }
     }
