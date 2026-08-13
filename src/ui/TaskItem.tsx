@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { cx } from '@/lib/cx'
 import { dateInputToDueAt, dueAtToDateInput, formatDueDate, formatEstimate, isOverdue } from '@/lib/dates'
 import { ScheduleDialog, formatSlot } from '@/ui/ScheduleDialog'
-import type { Priority, Project, Task, TaskPatch } from '@/lib/types'
+import type { EnergyLevel, Priority, Project, Task, TaskPatch } from '@/lib/types'
 
 const PRIORITY_LABEL: Record<Priority, string> = {
   0: 'Без приоритета',
@@ -16,6 +16,17 @@ const PRIORITY_COLOR: Record<Priority, string | null> = {
   1: 'var(--c-prio-1)',
   2: 'var(--c-prio-2)',
   3: 'var(--c-prio-3)',
+}
+
+const ENERGY_OPTIONS: ReadonlyArray<{ value: EnergyLevel | null; label: string }> = [
+  { value: null, label: '—' },
+  { value: 'light', label: 'Лёгкая ⚡' },
+  { value: 'heavy', label: 'Тяжёлая ⚡⚡' },
+]
+
+const ENERGY_TITLE: Record<EnergyLevel, string> = {
+  light: 'Лёгкая задача',
+  heavy: 'Тяжёлая задача',
 }
 
 interface Props {
@@ -93,6 +104,15 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
                   aria-hidden="true"
                 />
                 {PRIORITY_LABEL[task.priority]}
+              </span>
+            )}
+            {task.energy && (
+              <span
+                title={ENERGY_TITLE[task.energy]}
+                aria-label={ENERGY_TITLE[task.energy]}
+                className={task.energy === 'heavy' ? 'text-warn' : 'text-faint'}
+              >
+                {task.energy === 'heavy' ? '⚡⚡' : '⚡'}
               </span>
             )}
             {task.due_at && (
@@ -197,6 +217,36 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
               ))}
             </select>
           </label>
+
+          <div className="flex flex-col gap-1">
+            <span className="font-mono text-[0.65rem] tracking-[0.1em] text-muted uppercase">Энергия</span>
+            <div
+              role="group"
+              aria-label="Энергия"
+              className="flex overflow-hidden rounded-control border border-rule bg-field"
+            >
+              {ENERGY_OPTIONS.map((opt, i) => {
+                const active = task.energy === opt.value
+                return (
+                  <button
+                    key={opt.label}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => {
+                      if (!active) onPatch({ energy: opt.value })
+                    }}
+                    className={cx(
+                      'flex-1 px-2 py-1.5 text-sm whitespace-nowrap transition-colors',
+                      i > 0 && 'border-l border-rule',
+                      active ? 'bg-accent text-ground' : 'text-muted hover:bg-sunken hover:text-ink',
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
 
           <div className="sm:col-span-2 flex flex-wrap items-center gap-2">
             <button
