@@ -490,6 +490,213 @@ async function runSync(db: SupabaseClient, userId: string): Promise<Record<strin
   }
 }
 
+/**
+ * Deterministic Google event id for a task. Google accepts client-supplied ids
+ * in base32hex (a-v, 0-9); uuid hex digits plus a 'tsk' prefix fit entirely,
+ * so a retried create collides with itself (409) instead of duplicating.
+ */
+function eventIdForTask(taskId: string): string {
+  return 'tsk' + taskId.replace(/-/g, '').toLowerCase()
+}
+
+interface OutboxTask {
+  id: string
+  user_id: string
+  title: string
+  notes: string | null
+  status: string
+  scheduled_start: string | null
+  scheduled_end: string | null
+  gcal_event_id: string | null
+}
+
+function eventBodyForTask(task: OutboxTask): Record<string, unknown> {
+  return {
+    summary: (task.status === 'done' ? '✔ ' : '') + task.title,
+    description: task.notes ?? '',
+    start: { dateTime: task.scheduled_start },
+    end: { dateTime: task.scheduled_end },
+    // The marker phase 4's echo suppression and reconcile key off.
+    extendedProperties: { private: { plannerTaskId: task.id } },
+  }
+}
+
+/**
+ * Pushes pending outbox rows to Google. Retries back off exponentially and
+ * cap at an hour; a row only dies when its task disappears. The drain is
+ * invoked opportunistically after user actions now and by cron in phase 4 --
+ * a failed nudge is never lost work, only deferred.
+ */
+async function drainOutbox(db: SupabaseClient): Promise<{ processed: number; failed: number }> {
+  const { data: rows } = await db
+    .from('planner_outbox')
+    .select('*')
+    .is('done_at', null)
+    .lte('next_attempt_at', new Date().toISOString())
+    .order('id', { ascending: true })
+    .limit(25)
+
+  if (!rows?.length) return { processed: 0, failed: 0 }
+
+  const tokens = new Map<string, string>()
+  let processed = 0
+  let failed = 0
+
+  for (const row of rows) {
+    try {
+      let accessToken = tokens.get(row.user_id)
+      if (!accessToken) {
+        accessToken = await getAccessToken(db, row.user_id)
+        tokens.set(row.user_id, accessToken)
+      }
+
+      const { data: task } = await db
+        .from('planner_tasks')
+        .select('id, user_id, title, notes, status, scheduled_start, scheduled_end, gcal_event_id')
+        .eq('id', row.task_id)
+        .maybeSingle()
+
+      const markDone = () =>
+        db.from('planner_outbox').update({ done_at: new Date().toISOString() }).eq('id', row.id)
+
+      if (row.op === 'delete') {
+        const eventId = row.payload?.gcal_event_id ?? task?.gcal_event_id
+        if (eventId) {
+          const res = await fetch(`${EVENTS('primary')}/${encodeURIComponent(eventId)}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${accessToken}` },
+          })
+          // 404/410 mean already gone -- the desired state, not an error.
+          if (!res.ok && res.status !== 404 && res.status !== 410) {
+            throw new Error(`delete_failed_${res.status}`)
+          }
+          await db
+            .from('planner_calendar_events')
+            .delete()
+            .eq('user_id', row.user_id)
+            .eq('gcal_event_id', eventId)
+        }
+        if (task?.gcal_event_id) {
+          await db.from('planner_tasks').update({ gcal_event_id: null, gcal_etag: null }).eq('id', task.id)
+        }
+        await markDone()
+        processed++
+        continue
+      }
+
+      // create/update below need a live, schedulable task; if it vanished or
+      // unscheduled since enqueue, the trigger has queued the matching delete.
+      if (!task || !task.scheduled_start || !task.scheduled_end) {
+        await markDone()
+        continue
+      }
+
+      const body = eventBodyForTask(task)
+      let res: Response
+
+      if (row.op === 'create' || !task.gcal_event_id) {
+        res = await fetch(EVENTS('primary'), {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...body, id: eventIdForTask(task.id) }),
+        })
+        // 409: this exact create already succeeded once (retry after a lost
+        // response). Converge by patching the same deterministic id.
+        if (res.status === 409) {
+          res = await fetch(`${EVENTS('primary')}/${eventIdForTask(task.id)}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          })
+        }
+      } else {
+        res = await fetch(`${EVENTS('primary')}/${encodeURIComponent(task.gcal_event_id)}`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        // The event died remotely; recreate under the same deterministic id.
+        if (res.status === 404 || res.status === 410) {
+          res = await fetch(EVENTS('primary'), {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...body, id: eventIdForTask(task.id) }),
+          })
+        }
+      }
+
+      if (!res.ok) throw new Error(`${row.op}_failed_${res.status}`)
+
+      const event = (await res.json()) as GoogleEvent & { htmlLink?: string }
+
+      // Bookkeeping write: gcal_* are outside the trigger's relevant-field row,
+      // so this does not re-enqueue, and outside bump_local_updated_at's list,
+      // so it does not masquerade as a local edit.
+      await db
+        .from('planner_tasks')
+        .update({ gcal_event_id: event.id, gcal_etag: event.etag ?? null })
+        .eq('id', task.id)
+
+      // Seed the mirror immediately: the grid shows the event without waiting
+      // for the next pull, and the stored etag lets phase 4 drop our own echo.
+      const { start, end, allDay } = eventBounds(event)
+      await db.from('planner_calendar_events').upsert(
+        {
+          user_id: row.user_id,
+          gcal_event_id: event.id,
+          calendar_id: 'primary',
+          etag: event.etag ?? null,
+          summary: event.summary ?? null,
+          start_at: start,
+          end_at: end,
+          is_all_day: allDay,
+          status: event.status ?? 'confirmed',
+          html_link: event.htmlLink ?? null,
+          remote_updated_at: event.updated ?? null,
+          owned_by_app: true,
+          raw: event as unknown as Record<string, unknown>,
+          synced_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id,gcal_event_id' },
+      )
+
+      await markDone()
+      processed++
+    } catch (e) {
+      failed++
+      const message = e instanceof Error ? e.message : 'unknown'
+      const attempts = (row.attempts ?? 0) + 1
+      const backoffMinutes = Math.min(2 ** attempts, 60)
+      await db
+        .from('planner_outbox')
+        .update({
+          attempts,
+          last_error: message,
+          next_attempt_at: new Date(Date.now() + backoffMinutes * 60_000).toISOString(),
+        })
+        .eq('id', row.id)
+    }
+  }
+
+  return { processed, failed }
+}
+
+async function handleDrain(req: Request): Promise<Response> {
+  const user = await requireUser(req)
+  if (!user) return json({ error: 'unauthorized' }, 401)
+  const db = admin()
+  const result = await drainOutbox(db)
+  await db.from('planner_sync_runs').insert({
+    user_id: user.id,
+    kind: 'outbox',
+    finished_at: new Date().toISOString(),
+    ok: result.failed === 0,
+    changed_count: result.processed,
+    error: result.failed ? `${result.failed} rows failed` : null,
+  })
+  return json(result)
+}
+
 async function handleSync(req: Request): Promise<Response> {
   const user = await requireUser(req)
   if (!user) return json({ error: 'unauthorized' }, 401)
@@ -541,6 +748,8 @@ Deno.serve(async (req) => {
         return await handleCalendars(req)
       case 'sync':
         return await handleSync(req)
+      case 'drain':
+        return await handleDrain(req)
       case 'disconnect':
         return await handleDisconnect(req)
       default:

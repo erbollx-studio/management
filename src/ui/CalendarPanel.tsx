@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { useCalendars, useConnectGoogle, useDisconnectGoogle, useGoogleAccount } from '@/data/calendar'
 import { cx } from '@/lib/cx'
+import type { Task } from '@/lib/types'
 
 // FullCalendar is ~200 KB minified; keep it out of the main bundle so the
 // task views load without it.
@@ -18,10 +19,11 @@ const CALLBACK_DETAIL: Record<string, string> = {
   google_client_not_configured: 'На сервере не заданы GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET.',
 }
 
-export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallback }: {
+export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallback, tasks }: {
   callbackStatus: string | null
   callbackDetail: string | null
   onDismissCallback: () => void
+  tasks: Task[]
 }) {
   const { data: account, isLoading } = useGoogleAccount()
   const connect = useConnectGoogle()
@@ -127,7 +129,7 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
       )}
 
       <Suspense fallback={<p className="text-sm text-faint">Загружаем сетку…</p>}>
-        <CalendarGrid connected={connected} />
+        <CalendarGrid connected={connected} tasks={tasks} />
       </Suspense>
     </div>
   )

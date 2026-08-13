@@ -106,6 +106,7 @@ function Workspace() {
               callbackStatus={callback.status}
               callbackDetail={callback.detail}
               onDismissCallback={() => setCallback({ status: null, detail: null })}
+              tasks={tasks}
             />
           ) : (
             <>

@@ -28,6 +28,16 @@ export function useCalendarEvents(from: Date, to: Date, enabled: boolean) {
   })
 }
 
+/**
+ * App-owned mirror rows carry the planner task id inside Google's private
+ * extended properties — that link is what lets a dragged event find its task.
+ */
+export function taskIdOfEvent(e: CalendarEvent): string | null {
+  const raw = e.raw as { extendedProperties?: { private?: { plannerTaskId?: unknown } } } | null
+  const id = raw?.extendedProperties?.private?.plannerTaskId
+  return typeof id === 'string' && id ? id : null
+}
+
 /** Fire the incremental pull, then re-read whatever window is on screen. */
 export function useSyncNow() {
   const qc = useQueryClient()
