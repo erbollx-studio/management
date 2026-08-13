@@ -1,0 +1,31 @@
+# Layer 4 of the sync durability model (docs/ARCHITECTURE.md §5): the watchdog
+# that lives OUTSIDE Supabase, because a cron inside Supabase cannot report
+# that Supabase is down. When this job fails, GitHub emails the repo owner —
+# that email is the alert channel, no extra service needed.
+#
+# The health endpoint is public by design and returns only booleans and ages.
+# It answers 503 when: no successful sync in 45 minutes (four missed ticks),
+# the Google connection needs re-auth, or failures are stacking up.
+
+name: watchdog
+
+on:
+  schedule:
+    # Hourly, off the top of the hour (GitHub delays :00 jobs under load).
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check sync health
+        run: |
+          set -euo pipefail
+          BODY=$(curl -sS --max-time 30 \
+            "https://vqexlrqphddnnbveppbl.supabase.co/functions/v1/google-calendar/health")
+          echo "health: $BODY"
+          echo "$BODY" | jq -e '.ok == true' > /dev/null || {
+            echo "::error::Sync is unhealthy: $BODY"
+            exit 1
+          }

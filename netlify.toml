@@ -1,0 +1,12 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+# SPA fallback: every route is served by the client router.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
