@@ -1,6 +1,8 @@
-import { lazy, Suspense } from 'react'
-import { useCalendars, useConnectGoogle, useDisconnectGoogle, useGoogleAccount } from '@/data/calendar'
+import { lazy, Suspense, useState } from 'react'
+import { useConnectGoogle, useGoogleAccount } from '@/data/calendar'
 import { cx } from '@/lib/cx'
+import { SettingsSheet } from './calendar/SettingsSheet'
+import { SyncStatus } from './calendar/SyncStatus'
 import type { Task } from '@/lib/types'
 
 // FullCalendar is ~200 KB minified; keep it out of the main bundle so the
@@ -19,6 +21,11 @@ const CALLBACK_DETAIL: Record<string, string> = {
   google_client_not_configured: 'На сервере не заданы GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET.',
 }
 
+/**
+ * The calendar page as a working desk: a quiet toolbar (sync + settings),
+ * the tray of unscheduled tasks, then the grid. Connection plumbing lives in
+ * the settings sheet — only broken states stay inline where they can't hide.
+ */
 export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallback, tasks }: {
   callbackStatus: string | null
   callbackDetail: string | null
@@ -27,10 +34,9 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
 }) {
   const { data: account, isLoading } = useGoogleAccount()
   const connect = useConnectGoogle()
-  const disconnect = useDisconnectGoogle()
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   const connected = account?.status === 'connected'
-  const calendars = useCalendars(connected)
 
   return (
     <div className="flex flex-col gap-4">
@@ -57,29 +63,22 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
       ) : !account ? (
         <Disconnected onConnect={() => connect.mutate()} busy={connect.isPending} error={connect.error} />
       ) : (
-        <div className="overflow-hidden rounded-card border border-hair bg-surface">
-          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-hair px-4 py-3">
-            <div className="min-w-0">
-              <p className="font-mono text-[0.68rem] tracking-[0.12em] text-muted uppercase">
-                {account.status === 'connected' ? 'Подключено' : 'Требуется повторный вход'}
-              </p>
-              <p className="mt-1 truncate text-sm">{account.email ?? 'аккаунт Google'}</p>
-              <p className="mt-0.5 font-mono text-[0.68rem] text-faint">
-                с {new Date(account.connected_at).toLocaleDateString('ru')}
-              </p>
-            </div>
+        <>
+          <div className="flex items-center justify-between gap-3">
+            {/* Sync only makes sense against a live token; keep the row shape either way. */}
+            {connected ? <SyncStatus /> : <span aria-hidden="true" />}
             <button
               type="button"
-              onClick={() => disconnect.mutate()}
-              disabled={disconnect.isPending}
-              className="shrink-0 rounded-control border border-rule px-2.5 py-1 font-mono text-[0.7rem] text-danger transition-colors hover:border-danger disabled:opacity-50"
+              onClick={() => setSettingsOpen(true)}
+              className="shrink-0 rounded-control px-2 py-1 font-mono text-[0.7rem] text-muted transition-colors hover:bg-sunken hover:text-ink"
             >
-              Отключить
+              Настройки
             </button>
           </div>
 
+          {/* A broken connection must not hide in a sheet — it stays inline. */}
           {account.status !== 'connected' && (
-            <div className="border-b border-hair px-4 py-3">
+            <div className="rounded-card border border-danger/50 bg-surface px-4 py-3">
               <p className="text-sm text-danger">
                 {account.last_error ?? 'Токен больше не действует.'}
               </p>
@@ -93,44 +92,16 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
               </button>
             </div>
           )}
-
-          <div className="px-4 py-3">
-            <h3 className="font-mono text-[0.65rem] tracking-[0.12em] text-muted uppercase">Календари</h3>
-            {calendars.isLoading && <p className="mt-2 text-sm text-faint">Загружаем…</p>}
-            {calendars.error && (
-              <p className="mt-2 text-sm text-danger">
-                Не удалось получить список: {calendars.error.message}
-              </p>
-            )}
-            {calendars.data && (
-              <ul className="mt-2 flex flex-col gap-1.5">
-                {calendars.data.map((c) => (
-                  <li key={c.id} className="flex items-center gap-2 text-sm">
-                    <span
-                      className="size-2 shrink-0 rounded-full"
-                      style={{ background: c.backgroundColor ?? 'var(--c-rule)' }}
-                      aria-hidden="true"
-                    />
-                    <span className="min-w-0 flex-1 truncate">{c.summary}</span>
-                    {c.primary && (
-                      <span className="shrink-0 font-mono text-[0.62rem] tracking-wider text-faint uppercase">
-                        основной
-                      </span>
-                    )}
-                  </li>
-                ))}
-                {calendars.data.length === 0 && (
-                  <li className="text-sm text-faint">Календарей с правом записи не найдено.</li>
-                )}
-              </ul>
-            )}
-          </div>
-        </div>
+        </>
       )}
 
       <Suspense fallback={<p className="text-sm text-faint">Загружаем сетку…</p>}>
         <CalendarGrid connected={connected} tasks={tasks} />
       </Suspense>
+
+      {settingsOpen && account && (
+        <SettingsSheet account={account} onClose={() => setSettingsOpen(false)} />
+      )}
     </div>
   )
 }

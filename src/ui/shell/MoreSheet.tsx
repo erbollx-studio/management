@@ -8,6 +8,8 @@ const EXTRA_VIEWS: Array<{ view: View; label: string }> = [
   { view: { kind: 'upcoming' }, label: 'Предстоящие' },
   { view: { kind: 'inbox' }, label: 'Входящие' },
   { view: { kind: 'done' }, label: 'Выполненные' },
+  { view: { kind: 'recurring' }, label: 'Повторяющиеся' },
+  { view: { kind: 'review' }, label: 'Обзор' },
 ]
 
 interface Props {

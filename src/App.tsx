@@ -11,6 +11,8 @@ import { CommandLayer } from '@/ui/CommandLayer'
 import { QuickAdd } from '@/ui/QuickAdd'
 import { Sidebar } from '@/ui/Sidebar'
 import { TaskList } from '@/ui/TaskList'
+import { RecurringView } from '@/ui/recurring/RecurringView'
+import { ReviewView } from '@/ui/review/ReviewView'
 import { MoreSheet } from '@/ui/shell/MoreSheet'
 import { TabBar } from '@/ui/shell/TabBar'
 import { TodayView } from '@/ui/today/TodayView'
@@ -127,8 +129,8 @@ function Workspace() {
         </aside>
 
         <main className="flex min-w-0 flex-1 flex-col gap-4">
-          {/* TodayView carries its own serif header with date and progress. */}
-          {view.kind !== 'today' && (
+          {/* TodayView/ReviewView/RecurringView carry their own headers. */}
+          {view.kind !== 'today' && view.kind !== 'review' && view.kind !== 'recurring' && (
             <div className="flex items-baseline justify-between gap-3">
               <h1 className="font-serif text-2xl font-semibold tracking-tight">{title}</h1>
               {view.kind !== 'calendar' && (
@@ -144,6 +146,10 @@ function Workspace() {
               onDismissCallback={() => setCallback({ status: null, detail: null })}
               tasks={tasks}
             />
+          ) : view.kind === 'recurring' ? (
+            <RecurringView projects={projects} />
+          ) : view.kind === 'review' ? (
+            <ReviewView tasks={tasks} />
           ) : view.kind === 'today' ? (
             <>
               {/* Quick capture stays on the command center so the `n` hotkey

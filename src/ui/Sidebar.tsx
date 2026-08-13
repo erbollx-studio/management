@@ -61,19 +61,27 @@ export function Sidebar({ current, onSelect, tasks }: Props) {
       </ul>
 
       <ul className="flex flex-col">
-        <li>
-          <button
-            type="button"
-            onClick={() => onSelect({ kind: 'calendar' })}
-            aria-current={activeKey === 'calendar' ? 'page' : undefined}
-            className={cx(
-              'w-full rounded-control px-2.5 py-1.5 text-left text-sm transition-colors',
-              activeKey === 'calendar' ? 'bg-sunken font-medium text-ink' : 'text-muted hover:text-ink',
-            )}
-          >
-            Календарь
-          </button>
-        </li>
+        {(
+          [
+            [{ kind: 'calendar' }, 'Календарь'],
+            [{ kind: 'recurring' }, 'Повторяющиеся'],
+            [{ kind: 'review' }, 'Обзор'],
+          ] as Array<[View, string]>
+        ).map(([view, label]) => (
+          <li key={viewKey(view)}>
+            <button
+              type="button"
+              onClick={() => onSelect(view)}
+              aria-current={viewKey(view) === activeKey ? 'page' : undefined}
+              className={cx(
+                'w-full rounded-control px-2.5 py-1.5 text-left text-sm transition-colors',
+                viewKey(view) === activeKey ? 'bg-sunken font-medium text-ink' : 'text-muted hover:text-ink',
+              )}
+            >
+              {label}
+            </button>
+          </li>
+        ))}
       </ul>
 
       <div className="flex flex-col gap-1">
