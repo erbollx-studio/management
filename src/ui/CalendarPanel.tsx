@@ -37,8 +37,8 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
       {callbackStatus && (
         <div
           className={cx(
-            'flex items-start justify-between gap-4 border px-3 py-2.5 text-sm',
-            callbackStatus === 'connected' ? 'border-hair bg-surface' : 'border-danger',
+            'flex items-start justify-between gap-4 rounded-control border bg-surface px-3 py-2.5 text-sm',
+            callbackStatus === 'connected' ? 'border-hair' : 'border-danger/50 text-danger',
           )}
         >
           <p className="min-w-0">
@@ -57,7 +57,7 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
       ) : !account ? (
         <Disconnected onConnect={() => connect.mutate()} busy={connect.isPending} error={connect.error} />
       ) : (
-        <div className="border border-hair bg-surface">
+        <div className="overflow-hidden rounded-card border border-hair bg-surface">
           <div className="flex flex-wrap items-start justify-between gap-3 border-b border-hair px-4 py-3">
             <div className="min-w-0">
               <p className="font-mono text-[0.68rem] tracking-[0.12em] text-muted uppercase">
@@ -72,7 +72,7 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
               type="button"
               onClick={() => disconnect.mutate()}
               disabled={disconnect.isPending}
-              className="shrink-0 border border-hair px-2.5 py-1 font-mono text-[0.7rem] text-danger hover:border-danger disabled:opacity-50"
+              className="shrink-0 rounded-control border border-rule px-2.5 py-1 font-mono text-[0.7rem] text-danger transition-colors hover:border-danger disabled:opacity-50"
             >
               Отключить
             </button>
@@ -87,7 +87,7 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
                 type="button"
                 onClick={() => connect.mutate()}
                 disabled={connect.isPending}
-                className="mt-3 border border-ink bg-ink px-3 py-1.5 text-sm text-surface hover:opacity-85 disabled:opacity-50"
+                className="mt-3 rounded-control bg-accent px-3 py-1.5 text-sm font-medium text-ground transition-colors hover:bg-ink disabled:bg-hair disabled:text-faint"
               >
                 Подключить заново
               </button>
@@ -107,7 +107,7 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
                 {calendars.data.map((c) => (
                   <li key={c.id} className="flex items-center gap-2 text-sm">
                     <span
-                      className="size-2 shrink-0"
+                      className="size-2 shrink-0 rounded-full"
                       style={{ background: c.backgroundColor ?? 'var(--c-rule)' }}
                       aria-hidden="true"
                     />
@@ -137,8 +137,8 @@ export function CalendarPanel({ callbackStatus, callbackDetail, onDismissCallbac
 
 function Disconnected({ onConnect, busy, error }: { onConnect: () => void; busy: boolean; error: Error | null }) {
   return (
-    <div className="border border-hair bg-surface p-5">
-      <h2 className="font-mono text-base font-semibold">Google Calendar не подключён</h2>
+    <div className="rounded-card border border-hair bg-surface p-5">
+      <h2 className="font-serif text-lg font-semibold">Google Calendar не подключён</h2>
       <p className="mt-2 max-w-prose text-sm text-muted">
         Приложение запросит доступ к событиям календаря. Пока это только чтение списка календарей —
         задачи в календарь ещё не пишутся.
@@ -147,7 +147,7 @@ function Disconnected({ onConnect, busy, error }: { onConnect: () => void; busy:
         type="button"
         onClick={onConnect}
         disabled={busy}
-        className="mt-5 border border-ink bg-ink px-4 py-2 text-sm font-medium text-surface hover:opacity-85 disabled:opacity-50"
+        className="mt-5 rounded-control bg-accent px-4 py-2 text-sm font-medium text-ground transition-colors hover:bg-ink disabled:bg-hair disabled:text-faint"
       >
         {busy ? 'Открываем Google…' : 'Подключить Google Calendar'}
       </button>

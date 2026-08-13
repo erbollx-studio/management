@@ -22,12 +22,12 @@ export function QuickAdd({ view }: { view: View }) {
         onChange={(e) => setTitle(e.target.value)}
         placeholder="Новая задача…"
         aria-label="Название новой задачи"
-        className="min-w-0 flex-1 border border-hair bg-surface px-3 py-2.5 text-sm placeholder:text-faint focus:border-rule focus:outline-none"
+        className="min-w-0 flex-1 rounded-control border border-rule bg-field px-3 py-2 text-sm placeholder:text-faint focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
       />
       <button
         type="submit"
         disabled={!title.trim() || create.isPending}
-        className="shrink-0 border border-ink bg-ink px-4 py-2.5 text-sm font-medium text-surface transition-opacity hover:opacity-85 disabled:opacity-40"
+        className="shrink-0 rounded-control bg-accent px-4 py-2 text-sm font-medium text-ground transition-colors hover:bg-ink disabled:bg-hair disabled:text-faint"
       >
         Добавить
       </button>

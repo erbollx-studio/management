@@ -48,7 +48,7 @@ export function Sidebar({ current, onSelect, tasks }: Props) {
                 onClick={() => onSelect(view)}
                 aria-current={active ? 'page' : undefined}
                 className={cx(
-                  'flex w-full items-center justify-between px-2.5 py-1.5 text-left text-sm transition-colors',
+                  'flex w-full items-center justify-between rounded-control px-2.5 py-1.5 text-left text-sm transition-colors',
                   active ? 'bg-sunken font-medium text-ink' : 'text-muted hover:text-ink',
                 )}
               >
@@ -67,7 +67,7 @@ export function Sidebar({ current, onSelect, tasks }: Props) {
             onClick={() => onSelect({ kind: 'calendar' })}
             aria-current={activeKey === 'calendar' ? 'page' : undefined}
             className={cx(
-              'w-full px-2.5 py-1.5 text-left text-sm transition-colors',
+              'w-full rounded-control px-2.5 py-1.5 text-left text-sm transition-colors',
               activeKey === 'calendar' ? 'bg-sunken font-medium text-ink' : 'text-muted hover:text-ink',
             )}
           >
@@ -98,7 +98,7 @@ export function Sidebar({ current, onSelect, tasks }: Props) {
               onBlur={() => !name.trim() && setAdding(false)}
               placeholder="Название проекта"
               aria-label="Название проекта"
-              className="w-full border border-hair bg-surface px-2 py-1 text-sm placeholder:text-faint focus:border-rule focus:outline-none"
+              className="w-full rounded-control border border-rule bg-field px-2 py-1 text-sm placeholder:text-faint focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
             />
           </form>
         )}
@@ -115,11 +115,11 @@ export function Sidebar({ current, onSelect, tasks }: Props) {
                   onClick={() => onSelect(view)}
                   aria-current={active ? 'page' : undefined}
                   className={cx(
-                    'flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-sm transition-colors',
+                    'flex w-full items-center gap-2 rounded-control px-2.5 py-1.5 text-left text-sm transition-colors',
                     active ? 'bg-sunken font-medium text-ink' : 'text-muted hover:text-ink',
                   )}
                 >
-                  <span className="size-1.5 shrink-0" style={{ background: p.color }} aria-hidden="true" />
+                  <span className="size-2 shrink-0 rounded-full" style={{ background: p.color }} aria-hidden="true" />
                   <span className="min-w-0 flex-1 truncate">{p.name}</span>
                   {count > 0 && <span className="font-mono text-[0.68rem] text-faint tabular-nums">{count}</span>}
                 </button>

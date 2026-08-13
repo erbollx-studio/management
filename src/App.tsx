@@ -95,7 +95,7 @@ function Workspace() {
 
         <main className="flex min-w-0 flex-1 flex-col gap-4">
           <div className="flex items-baseline justify-between gap-3">
-            <h1 className="font-mono text-xl font-semibold tracking-tight">{title}</h1>
+            <h1 className="font-serif text-2xl font-semibold tracking-tight">{title}</h1>
             {view.kind !== 'calendar' && (
               <span className="font-mono text-[0.68rem] text-faint tabular-nums">{visible.length}</span>
             )}
@@ -113,7 +113,7 @@ function Workspace() {
               {view.kind !== 'done' && <QuickAdd view={view} />}
 
               {error && (
-                <p className="border border-danger px-3 py-2 text-sm text-danger">
+                <p className="rounded-control border border-danger/50 bg-surface px-3 py-2 text-sm text-danger">
                   Не удалось загрузить задачи: {error.message}
                 </p>
               )}
@@ -138,9 +138,9 @@ function Centered({ children }: { children: React.ReactNode }) {
 function SetupNotice() {
   return (
     <div className="flex min-h-full items-center justify-center p-6">
-      <div className="w-full max-w-md border border-accent bg-surface p-6">
-        <p className="font-mono text-[0.68rem] tracking-[0.15em] text-accent uppercase">Нужна настройка</p>
-        <h1 className="mt-3 font-mono text-lg font-semibold">Не заданы переменные Supabase</h1>
+      <div className="w-full max-w-md rounded-card border border-hair bg-surface p-6">
+        <p className="font-mono text-[0.68rem] tracking-[0.15em] text-warn uppercase">Нужна настройка</p>
+        <h1 className="mt-3 font-serif text-xl font-semibold">Не заданы переменные Supabase</h1>
         <p className="mt-3 text-sm text-muted">
           Скопируйте <code className="font-mono text-ink">.env.example</code> в{' '}
           <code className="font-mono text-ink">.env</code> и укажите{' '}

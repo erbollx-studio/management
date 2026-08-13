@@ -43,8 +43,8 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
   }
 
   return (
-    <li className="border-b border-hair last:border-b-0">
-      <div className="flex items-start gap-3 px-3 py-2.5">
+    <li className="border-b border-sunken last:border-b-0">
+      <div className="flex items-start gap-3 px-3 py-2">
         <button
           type="button"
           role="checkbox"
@@ -52,8 +52,8 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
           aria-label={done ? 'Отметить как невыполненную' : 'Отметить как выполненную'}
           onClick={onToggleDone}
           className={cx(
-            'mt-0.5 grid size-[18px] shrink-0 place-items-center border transition-colors',
-            done ? 'border-accent bg-accent' : 'border-rule hover:border-ink',
+            'mt-0.5 grid size-4 shrink-0 place-items-center rounded-[4px] border-[1.5px] transition-colors',
+            done ? 'border-success bg-success' : 'border-faint hover:border-accent',
           )}
         >
           {done && (
@@ -78,7 +78,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
             aria-label="Название задачи"
             className={cx(
               'w-full bg-transparent text-sm focus:outline-none',
-              done && 'text-muted line-through',
+              done && 'text-faint line-through',
             )}
           />
 
@@ -86,7 +86,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
             {PRIORITY_COLOR[task.priority] && (
               <span className="flex items-center gap-1">
                 <span
-                  className="size-1.5"
+                  className="size-1.5 rounded-full"
                   style={{ background: PRIORITY_COLOR[task.priority] ?? undefined }}
                   aria-hidden="true"
                 />
@@ -94,15 +94,19 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
               </span>
             )}
             {task.due_at && (
-              <span className={cx(overdue && 'text-danger')}>
-                {overdue ? '⚠ ' : ''}
-                {formatDueDate(task.due_at)}
-              </span>
+              <span className={cx(overdue && 'text-danger')}>{formatDueDate(task.due_at)}</span>
             )}
             {task.estimate_minutes && <span>{formatEstimate(task.estimate_minutes)}</span>}
             {project && (
-              <span className="flex items-center gap-1">
-                <span className="size-1.5" style={{ background: project.color }} aria-hidden="true" />
+              <span
+                className="rounded-[4px] px-1.5 py-px font-sans text-[0.69rem] font-medium"
+                style={{
+                  // Mixing toward the text token keeps DB palette colors legible
+                  // on both the ivory and the charcoal surfaces.
+                  color: `color-mix(in srgb, ${project.color} 60%, var(--c-ink))`,
+                  background: `color-mix(in srgb, ${project.color} 14%, transparent)`,
+                }}
+              >
                 {project.name}
               </span>
             )}
@@ -131,7 +135,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
                 if (v !== (task.notes ?? '')) onPatch({ notes: v || null })
               }}
               rows={2}
-              className="resize-y border border-hair bg-surface px-2 py-1.5 text-sm focus:border-rule focus:outline-none"
+              className="resize-y rounded-control border border-rule bg-field px-2 py-1.5 text-sm focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
             />
           </label>
 
@@ -141,7 +145,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
               type="date"
               defaultValue={dueAtToDateInput(task.due_at)}
               onChange={(e) => onPatch({ due_at: dateInputToDueAt(e.target.value) })}
-              className="border border-hair bg-surface px-2 py-1.5 text-sm focus:border-rule focus:outline-none"
+              className="rounded-control border border-rule bg-field px-2 py-1.5 text-sm focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
             />
           </label>
 
@@ -157,7 +161,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
                 const n = e.target.value ? Number(e.target.value) : null
                 if (n !== task.estimate_minutes) onPatch({ estimate_minutes: n })
               }}
-              className="border border-hair bg-surface px-2 py-1.5 text-sm focus:border-rule focus:outline-none"
+              className="rounded-control border border-rule bg-field px-2 py-1.5 text-sm focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
             />
           </label>
 
@@ -166,7 +170,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
             <select
               value={task.project_id ?? ''}
               onChange={(e) => onPatch({ project_id: e.target.value || null })}
-              className="border border-hair bg-surface px-2 py-1.5 text-sm focus:border-rule focus:outline-none"
+              className="rounded-control border border-rule bg-field px-2 py-1.5 text-sm focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
             >
               <option value="">Входящие</option>
               {projects.map((p) => (
@@ -182,7 +186,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
             <select
               value={task.priority}
               onChange={(e) => onPatch({ priority: Number(e.target.value) as Priority })}
-              className="border border-hair bg-surface px-2 py-1.5 text-sm focus:border-rule focus:outline-none"
+              className="rounded-control border border-rule bg-field px-2 py-1.5 text-sm focus:border-accent focus:ring-[3px] focus:ring-accent/10 focus:outline-none"
             >
               {([0, 1, 2, 3] as const).map((p) => (
                 <option key={p} value={p}>
@@ -199,7 +203,7 @@ export function TaskItem({ task, projects, onPatch, onToggleDone, onDelete }: Pr
             <button
               type="button"
               onClick={onDelete}
-              className="border border-hair px-2.5 py-1 font-mono text-[0.7rem] text-danger hover:border-danger"
+              className="rounded-control border border-rule px-2.5 py-1 font-mono text-[0.7rem] text-danger transition-colors hover:border-danger"
             >
               Удалить
             </button>

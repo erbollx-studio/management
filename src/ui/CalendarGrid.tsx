@@ -38,8 +38,9 @@ export function CalendarGrid({ connected, tasks = [] }: { connected: boolean; ta
           editable: e.owned_by_app,
           startEditable: e.owned_by_app,
           durationEditable: e.owned_by_app,
-          backgroundColor: e.owned_by_app ? 'var(--c-accent)' : 'var(--c-prio-1)',
-          borderColor: 'transparent',
+          // Meridian event blocks: context tint + 3px context-colored left edge,
+          // styled in index.css — app-owned reads as ink, foreign as umber.
+          classNames: [e.owned_by_app ? 'evt-app' : 'evt-ext'],
         })),
     [events],
   )
@@ -61,7 +62,7 @@ export function CalendarGrid({ connected, tasks = [] }: { connected: boolean; ta
 
   if (!connected) {
     return (
-      <p className="border border-dashed border-hair px-4 py-8 text-center text-sm text-faint">
+      <p className="rounded-card border border-dashed border-rule px-4 py-8 text-center text-sm text-faint">
         Сетка появится после подключения Google Calendar.
       </p>
     )
@@ -74,7 +75,7 @@ export function CalendarGrid({ connected, tasks = [] }: { connected: boolean; ta
           type="button"
           onClick={() => sync.mutate()}
           disabled={sync.isPending}
-          className="border border-hair px-3 py-1.5 font-mono text-[0.72rem] text-muted hover:text-ink disabled:opacity-50"
+          className="rounded-control border border-rule bg-surface px-3 py-1.5 text-[0.8rem] font-medium text-ink transition-colors hover:border-accent disabled:opacity-50"
         >
           {sync.isPending ? 'Синхронизация…' : 'Синхронизировать'}
         </button>
@@ -85,20 +86,20 @@ export function CalendarGrid({ connected, tasks = [] }: { connected: boolean; ta
       </div>
 
       {error && (
-        <p className="border border-danger px-3 py-2 text-sm text-danger">
+        <p className="rounded-control border border-danger/50 bg-surface px-3 py-2 text-sm text-danger">
           Не удалось прочитать события: {error.message}
         </p>
       )}
 
       {scheduleTask.error && (
-        <p className="border border-danger px-3 py-2 text-sm text-danger">
+        <p className="rounded-control border border-danger/50 bg-surface px-3 py-2 text-sm text-danger">
           Не удалось запланировать: {scheduleTask.error.message}
         </p>
       )}
 
       <TaskTray tasks={tasks} />
 
-      <div className="calendar-shell border border-hair bg-surface">
+      <div className="calendar-shell overflow-hidden rounded-card border border-hair bg-surface">
         <FullCalendar
           plugins={[timeGridPlugin, interactionPlugin]}
           initialView="timeGridWeek"

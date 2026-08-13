@@ -293,6 +293,14 @@ async function handleCallback(req: Request): Promise<Response> {
   )
   if (tokenError) return redirectToApp('error', 'token_write_failed')
 
+  // Best effort: get push notifications flowing right away rather than
+  // waiting for the first cron tick. A failure here self-heals within 10 min.
+  try {
+    await ensureChannel(db, handshake.user_id, token.access_token)
+  } catch (e) {
+    console.error('ensureChannel at callback', e)
+  }
+
   return redirectToApp('connected')
 }
 
@@ -357,10 +365,14 @@ function eventBounds(e: GoogleEvent): { start: string | null; end: string | null
  * Google expires sync tokens as normal operation, and a sync_runs row written
  * either way so a silent failure still leaves a trace.
  */
-async function runSync(db: SupabaseClient, userId: string): Promise<Record<string, unknown>> {
+async function runSync(
+  db: SupabaseClient,
+  userId: string,
+  kind: 'poll' | 'push' | 'reconcile' = 'poll',
+): Promise<Record<string, unknown>> {
   const { data: run } = await db
     .from('planner_sync_runs')
-    .insert({ user_id: userId, kind: 'poll' })
+    .insert({ user_id: userId, kind })
     .select('id')
     .single()
 
@@ -454,11 +466,40 @@ async function runSync(db: SupabaseClient, userId: string): Promise<Record<strin
       })
 
       if (rows.length) {
+        // Echo detection needs the etags Google gave us LAST time, so read
+        // them before the upsert overwrites the shadow copy.
+        const { data: existing } = await db
+          .from('planner_calendar_events')
+          .select('gcal_event_id, etag')
+          .eq('user_id', userId)
+          .in('gcal_event_id', rows.map((r) => r.gcal_event_id))
+        const previousEtag = new Map((existing ?? []).map((r) => [r.gcal_event_id, r.etag]))
+
         const { error } = await db
           .from('planner_calendar_events')
           .upsert(rows, { onConflict: 'user_id,gcal_event_id' })
         if (error) throw new Error(`shadow_write_failed: ${error.message}`)
         changed += rows.length
+
+        // Two-way half: changes to app-owned events flow back into their
+        // tasks. An unchanged etag is our own write echoing back -- dropped
+        // here. The rest is decided in SQL: same times = noop, newer local
+        // edit = conflict logged + local wins, otherwise the task follows.
+        for (const item of body.items ?? []) {
+          const marker = item.extendedProperties?.private?.plannerTaskId
+          if (!marker) continue
+          if (previousEtag.get(item.id) === (item.etag ?? null)) continue
+          const { start, end } = eventBounds(item)
+          await db.rpc('planner_apply_remote_event', {
+            p_user_id: userId,
+            p_gcal_event_id: item.id,
+            p_start: start,
+            p_end: end,
+            p_cancelled: item.status === 'cancelled',
+            p_etag: item.etag ?? null,
+            p_remote_updated: item.updated ?? new Date().toISOString(),
+          })
+        }
       }
 
       pageToken = body.nextPageToken ?? null
@@ -681,6 +722,210 @@ async function drainOutbox(db: SupabaseClient): Promise<{ processed: number; fai
   return { processed, failed }
 }
 
+// -------------------------------------------------------- push channel --
+
+const WEBHOOK_URL = `${SUPABASE_URL}/functions/v1/google-calendar/webhook`
+
+/**
+ * Registers (or renews) the events.watch channel. Channels never auto-renew,
+ * and Google's TTLs are undocumented and have changed, so renewal keys off the
+ * expiration Google actually returned: anything inside a 2-day margin is
+ * replaced. Overlapping channels are harmless -- both just trigger a sync the
+ * syncToken makes idempotent.
+ */
+async function ensureChannel(db: SupabaseClient, userId: string, accessToken: string): Promise<void> {
+  const { data: state } = await db
+    .from('planner_sync_state')
+    .select('channel_id, channel_resource_id, channel_expires_at, channel_token')
+    .eq('user_id', userId)
+    .maybeSingle()
+
+  if (
+    state?.channel_expires_at &&
+    Date.parse(state.channel_expires_at) > Date.now() + 2 * 86_400_000
+  ) {
+    return
+  }
+
+  // Best effort: a dying channel that refuses to stop just expires on its own.
+  if (state?.channel_id && state.channel_resource_id) {
+    await fetch('https://www.googleapis.com/calendar/v3/channels/stop', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: state.channel_id, resourceId: state.channel_resource_id }),
+    }).catch(() => undefined)
+  }
+
+  const channelToken = state?.channel_token ?? randomToken(24)
+  const channelId = crypto.randomUUID()
+
+  const res = await fetch(`${EVENTS('primary')}/watch`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: channelId,
+      type: 'web_hook',
+      address: WEBHOOK_URL,
+      token: channelToken,
+    }),
+  })
+  if (!res.ok) throw new Error(`watch_failed_${res.status}`)
+
+  const body = (await res.json()) as { resourceId?: string; expiration?: string }
+  await db
+    .from('planner_sync_state')
+    .upsert(
+      {
+        user_id: userId,
+        channel_id: channelId,
+        channel_resource_id: body.resourceId ?? null,
+        channel_expires_at: body.expiration
+          ? new Date(Number(body.expiration)).toISOString()
+          : null,
+        channel_token: channelToken,
+      },
+      { onConflict: 'user_id' },
+    )
+}
+
+/**
+ * Google's push notification: no body, only headers saying "something changed"
+ * -- a doorbell, not a letter. Validate the channel token, acknowledge fast,
+ * and run the incremental pull to learn what actually moved.
+ */
+async function handleWebhook(req: Request): Promise<Response> {
+  const channelId = req.headers.get('X-Goog-Channel-ID')
+  const channelToken = req.headers.get('X-Goog-Channel-Token')
+  const resourceState = req.headers.get('X-Goog-Resource-State')
+
+  if (!channelId || !channelToken) return new Response(null, { status: 200 })
+
+  const db = admin()
+  const { data: state } = await db
+    .from('planner_sync_state')
+    .select('user_id, channel_token')
+    .eq('channel_id', channelId)
+    .maybeSingle()
+
+  // Unknown channel (already replaced) or bad token: acknowledge and ignore.
+  // A non-200 would only make Google hammer the endpoint with retries.
+  if (!state || state.channel_token !== channelToken) {
+    return new Response(null, { status: 200 })
+  }
+
+  // 'sync' is the channel-created handshake ping; there is nothing to pull yet.
+  if (resourceState !== 'sync') {
+    const work = runSync(db, state.user_id, 'push')
+      .then(() => drainOutbox(db))
+      .catch((e) => console.error('webhook sync', e))
+    const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } })
+      .EdgeRuntime
+    if (runtime?.waitUntil) runtime.waitUntil(work)
+    else await work
+  }
+
+  return new Response(null, { status: 200 })
+}
+
+// ---------------------------------------------------------- cron + health --
+
+async function readCronToken(db: SupabaseClient): Promise<string | null> {
+  const { data } = await db
+    .from('planner_internal_config')
+    .select('value')
+    .eq('key', 'cron_token')
+    .maybeSingle()
+  return data?.value ?? null
+}
+
+/**
+ * The scheduled entry point. pg_cron reads the shared token straight from
+ * Postgres and sends it as a bearer; the same row is compared here, so the
+ * secret never has to exist in function env or dashboard config.
+ */
+async function handleCron(req: Request): Promise<Response> {
+  const db = admin()
+  const token = await readCronToken(db)
+  const auth = req.headers.get('Authorization')
+  if (!token || auth !== `Bearer ${token}`) return json({ error: 'unauthorized' }, 401)
+
+  const body = (await req.json().catch(() => ({}))) as { job?: string }
+  const job = body.job === 'reconcile' ? 'reconcile' : 'tick'
+
+  const { data: accounts } = await db
+    .from('planner_google_accounts')
+    .select('user_id')
+    .eq('status', 'connected')
+
+  const results: Record<string, unknown>[] = []
+
+  for (const account of accounts ?? []) {
+    try {
+      const accessToken = await getAccessToken(db, account.user_id)
+
+      if (job === 'reconcile') {
+        // Nightly: full window resync, then set-based drift repair. A repair
+        // that touches a lot is a bug report, so the counts go into the log.
+        await db.from('planner_sync_state').update({ sync_token: null }).eq('user_id', account.user_id)
+        await runSync(db, account.user_id, 'reconcile')
+        const { data: repaired } = await db.rpc('planner_reconcile_repair', {
+          p_user_id: account.user_id,
+        })
+        results.push({ user: account.user_id, repaired })
+      } else {
+        await ensureChannel(db, account.user_id, accessToken)
+        const sync = await runSync(db, account.user_id, 'poll')
+        results.push({ user: account.user_id, sync })
+      }
+    } catch (e) {
+      results.push({ user: account.user_id, error: e instanceof Error ? e.message : 'unknown' })
+    }
+  }
+
+  const drained = await drainOutbox(db)
+  return json({ job, results, drained })
+}
+
+/**
+ * Liveness for the external watchdog. Deliberately public and deliberately
+ * boring: booleans and ages only, no identifiers -- a cron inside Supabase
+ * cannot report that Supabase is down, so this must be checkable from outside
+ * with zero credentials.
+ */
+async function handleHealth(): Promise<Response> {
+  const db = admin()
+
+  const { data: lastOk } = await db
+    .from('planner_sync_runs')
+    .select('started_at')
+    .eq('ok', true)
+    .in('kind', ['poll', 'push', 'reconcile'])
+    .order('started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  const { data: accounts } = await db
+    .from('planner_google_accounts')
+    .select('status')
+
+  const { data: state } = await db
+    .from('planner_sync_state')
+    .select('consecutive_failures')
+    .order('consecutive_failures', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  const ageMinutes = lastOk ? Math.round((Date.now() - Date.parse(lastOk.started_at)) / 60_000) : null
+  const needsReauth = (accounts ?? []).some((a) => a.status === 'needs_reauth')
+  const failures = state?.consecutive_failures ?? 0
+  const hasAccounts = (accounts ?? []).length > 0
+
+  // 45 min = four missed 10-minute ticks: real breakage, not jitter.
+  const ok = !hasAccounts || (ageMinutes !== null && ageMinutes <= 45 && !needsReauth && failures < 3)
+
+  return json({ ok, last_ok_sync_minutes_ago: ageMinutes, needs_reauth: needsReauth, consecutive_failures: failures }, ok ? 200 : 503)
+}
+
 async function handleDrain(req: Request): Promise<Response> {
   const user = await requireUser(req)
   if (!user) return json({ error: 'unauthorized' }, 401)
@@ -750,6 +995,12 @@ Deno.serve(async (req) => {
         return await handleSync(req)
       case 'drain':
         return await handleDrain(req)
+      case 'webhook':
+        return await handleWebhook(req)
+      case 'cron':
+        return await handleCron(req)
+      case 'health':
+        return await handleHealth()
       case 'disconnect':
         return await handleDisconnect(req)
       default:

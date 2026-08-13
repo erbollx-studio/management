@@ -26,7 +26,7 @@ export function TaskTray({ tasks }: { tasks: Task[] }) {
   }, [])
 
   return (
-    <div ref={containerRef} className="border border-hair bg-surface">
+    <div ref={containerRef} className="overflow-hidden rounded-card border border-hair bg-surface">
       <p className="border-b border-hair px-3 py-1.5 font-mono text-[0.65rem] tracking-[0.12em] text-muted uppercase">
         Незапланированные
       </p>
@@ -39,7 +39,7 @@ export function TaskTray({ tasks }: { tasks: Task[] }) {
               key={t.id}
               data-task-id={t.id}
               data-estimate={t.estimate_minutes ?? ''}
-              className="flex max-w-full cursor-grab items-baseline gap-2 border border-hair bg-sunken px-2 py-1 text-sm select-none active:cursor-grabbing"
+              className="flex max-w-full cursor-grab items-baseline gap-2 rounded-block border-l-[3px] border-accent bg-accent-soft px-2 py-1 text-[0.8rem] font-medium select-none active:cursor-grabbing"
             >
               <span className="min-w-0 truncate">{t.title}</span>
               <span className="flex shrink-0 items-baseline gap-2 font-mono text-[0.66rem] text-muted">

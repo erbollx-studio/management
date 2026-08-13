@@ -14,14 +14,14 @@ export function TaskList({ tasks, projects, emptyMessage }: Props) {
 
   if (tasks.length === 0) {
     return (
-      <div className="border border-dashed border-hair px-4 py-10 text-center text-sm text-faint">
+      <div className="rounded-card border border-dashed border-rule px-4 py-10 text-center text-sm text-faint">
         {emptyMessage}
       </div>
     )
   }
 
   return (
-    <ul className="border border-hair bg-surface">
+    <ul className="overflow-hidden rounded-card border border-hair bg-surface">
       {tasks.map((task) => (
         <TaskItem
           key={task.id}
