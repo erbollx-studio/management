@@ -1,3 +1,3 @@
 # management
 
-- [`mail-bot/`](mail-bot/): get the mail from all your work inboxes in Telegram (Google Apps Script).
+- [`mail-bot/`](mail-bot/): all your work email in one Telegram chat (Supabase + Gmail sign-in).
