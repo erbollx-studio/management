@@ -248,10 +248,14 @@ async function edit(chat: string | number, messageId: number, text: string, mark
   })
 }
 
-/** Telegram lets bots delete messages for 48 hours; after that the message is shrunk to `fallback`. */
-async function remove(chat: string | number, messageId: number, fallback = '✓'): Promise<void> {
-  const res = await tg('deleteMessage', { chat_id: chat, message_id: messageId })
-  if (!res.ok) await edit(chat, messageId, fallback)
+/**
+ * Telegram lets bots delete messages for 48 hours. After that a text message
+ * is shrunk to "✓"; a file can't be shrunk, so it just loses its buttons.
+ */
+async function remove(chat: string | number, messageId: number): Promise<void> {
+  if ((await tg('deleteMessage', { chat_id: chat, message_id: messageId })).ok) return
+  if ((await edit(chat, messageId, '✓')).ok) return
+  await tg('editMessageReplyMarkup', { chat_id: chat, message_id: messageId, reply_markup: { inline_keyboard: [] } })
 }
 
 /** A Telegram refusal that retrying won't fix (bad request) versus one worth another try. */
@@ -365,7 +369,7 @@ async function pollAll(cfg: Config): Promise<number> {
         .eq('id', ib.id)
       // Told once when an inbox starts failing; /status shows it until it recovers.
       if (!ib.last_error && ib.status === 'connected') {
-        await send(chat, '⚠️ Couldn\'t check <b>' + esc(ib.email) + '</b>: ' + esc(message))
+        await send(chat, '⚠️ Couldn\'t check <b>' + esc(ib.email) + '</b>: ' + esc(message), TRASH)
       }
       return 0
     }
@@ -566,7 +570,7 @@ async function onUpdate(cfg: Config, u: any): Promise<void> {
   if (text.startsWith('/')) await onCommand(cfg, chat, text)
   else if (m.reply_to_message) await onReply(chat, m, text)
   else if (!(await applyAwaitedFilter(cfg, chat, text))) {
-    await send(chat, 'To answer an email, use Telegram\'s Reply on it. /help lists the commands.')
+    await send(chat, 'To answer an email, use Telegram\'s Reply on it. /help lists the commands.', TRASH)
   }
 }
 
@@ -605,18 +609,18 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdMuted(chat)
     case '/pause':
       await setConfig('paused', 'true')
-      await send(chat, '⏸ Paused. /resume turns emails back on.')
+      await send(chat, '⏸ Paused. /resume turns emails back on.', TRASH)
       return
     case '/resume':
       await setConfig('paused', 'false')
       // Fresh cursors: what arrived while paused is skipped, not dumped into the chat at once.
       await db.from('mailbot_inboxes').update({ history_id: null }).eq('status', 'connected')
-      await send(chat, '▶️ Back on. /unread shows what came in while paused.')
+      await send(chat, '▶️ Back on. /unread shows what came in while paused.', TRASH)
       return
     case '/status':
       return await cmdStatus(cfg, chat)
     default:
-      await send(chat, HELP)
+      await send(chat, HELP, TRASH)
   }
 }
 
@@ -673,7 +677,7 @@ async function cmdDisconnect(chat: string, arg: string): Promise<void> {
     console.error('revoke', e)
   }
   await db.rpc('mailbot_delete_inbox', { p_inbox_id: ib.id })
-  await send(chat, '🗑 Disconnected ' + esc(email) + '.')
+  await send(chat, '🗑 Disconnected ' + esc(email) + '.', TRASH)
 }
 
 async function cmdUnread(cfg: Config, chat: string): Promise<void> {
@@ -732,11 +736,15 @@ async function cmdMute(chat: string, arg: string, on: boolean): Promise<void> {
 
 /** /muted: everything stopped with 🔕, one tap to undo each. */
 async function mutedList(): Promise<{ text: string; markup: { inline_keyboard: Button[][] } }> {
-  const { data } = await db.from('mailbot_muted').select('id, entry').order('created_at')
-  const rows = data ?? []
-  if (!rows.length) return { text: 'Nothing is stopped. Use 🔕 on an email to stop emails like it.', markup: TRASH }
+  const { data, error } = await db.from('mailbot_muted').select('id, entry').order('created_at', { ascending: false })
+  if (error) throw new Error('mute list: ' + error.message)
+  const all = data ?? []
+  if (!all.length) return { text: 'Nothing is stopped. Use 🔕 on an email to stop emails like it.', markup: TRASH }
+  // Telegram refuses keyboards with about 100 buttons, so the newest 50 get one each.
+  const rows = all.slice(0, 50)
   return {
-    text: '🔕 <b>Stopped</b>. Tap one to get those emails again.',
+    text: '🔕 <b>Stopped</b>. Tap one to get those emails again.' +
+      (all.length > rows.length ? '\nShowing the newest ' + rows.length + ' of ' + all.length + '. For older ones: /unmute name@company.com' : ''),
     markup: {
       inline_keyboard: [
         ...rows.map((r) => [{ text: '↩ ' + clip(describeMute(r.entry), 55), callback_data: 'q:' + r.id }]),
@@ -778,8 +786,18 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
   try {
     if (act === 'X') {
       await remove(chat, messageId)
-    } else if (act === 'e' || act === 'z') {
-      toast = await onFilterButton(q, act, a)
+    } else if (act === 'd') {
+      // The card goes even when Gmail can't be reached (inbox disconnected, email gone).
+      await remove(chat, messageId)
+      toast = 'Removed from chat. Still in Gmail.'
+      try {
+        await gmail(await inboxById(Number(a)), `messages/${b}/modify`, { removeLabelIds: ['UNREAD'] })
+        toast += ' Marked read.'
+      } catch (e) {
+        console.error('mark read on delete', e)
+      }
+    } else if (act === 'e' || act === 'z' || act === 'x') {
+      toast = await onFilterButton(q, act === 'e' ? 'e' : 'z', a)
     } else if (act === 'q') {
       const { data: gone } = await db.from('mailbot_muted').delete().eq('id', Number(a)).select('entry').maybeSingle()
       if (gone) toast = 'Back on: ' + describeMute(gone.entry)
@@ -798,7 +816,11 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
     console.error('callback', q.data, e)
     toast = 'Failed: ' + errorText(e)
   }
-  await tg('answerCallbackQuery', { callback_query_id: q.id, text: toast.slice(0, 190) })
+  await tg('answerCallbackQuery', {
+    callback_query_id: q.id,
+    text: toast.slice(0, 190),
+    show_alert: toast.startsWith('Failed'),
+  })
 }
 
 /** Buttons on an email card. Old cards from before the redesign still send r, m and o. */
@@ -822,10 +844,6 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
     case 'r':
       await gmail(ib, `messages/${id}/modify`, { removeLabelIds: ['UNREAD'] })
       return 'Marked as read'
-    case 'd':
-      await gmail(ib, `messages/${id}/modify`, { removeLabelIds: ['UNREAD'] })
-      await remove(chat, messageId)
-      return 'Removed from chat. Still in Gmail, marked read.'
     case 'a': {
       const m = await gmail(ib, `messages/${id}?format=minimal`)
       await gmail(ib, `threads/${m.threadId}/modify`, { removeLabelIds: ['INBOX', 'UNREAD'] })
@@ -841,7 +859,7 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
     case 'm': {
       const email = readEmail(await gmail(ib, `messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`))
       const entry = muteEntry(email, kind ?? 's')
-      if (!entry) return ''
+      if (!entry) return 'This email has no sender address to stop'
       await db.from('mailbot_muted').upsert({ entry })
       const undo = { text: '↩ Undo', callback_data: `U:${ib.id}:${id}:${kind ?? 's'}` }
       await edit(chat, messageId, '🔕 Stopped: ' + esc(describeMute(entry)),
@@ -1054,10 +1072,17 @@ async function sendPendingReply(q: any, key: string, all: boolean): Promise<stri
   // Deleting is the claim: a double tap or a Telegram retry finds nothing the second time.
   const { data: p } = await db.from('mailbot_pending_replies').delete().eq('key', key).select().maybeSingle()
   if (!p) return 'Already sent or cancelled'
-  const ib = await inboxById(p.inbox_id)
-  const email = readEmail(await gmail(ib, `messages/${p.message_id}?format=metadata&${REPLY_HEADERS}`))
-  const reply = buildReply(email, ib.email, p.body, all)
-  await gmail(ib, 'messages/send', { raw: reply.raw, threadId: email.threadId })
+  let reply
+  try {
+    const ib = await inboxById(p.inbox_id)
+    const email = readEmail(await gmail(ib, `messages/${p.message_id}?format=metadata&${REPLY_HEADERS}`))
+    reply = buildReply(email, ib.email, p.body, all)
+    await gmail(ib, 'messages/send', { raw: reply.raw, threadId: email.threadId })
+  } catch (e) {
+    // Not sent: put the reply back so Send can be tapped again.
+    await db.from('mailbot_pending_replies').insert(p)
+    throw e
+  }
   await clearReplyMessages(q)
   return 'Sent to ' + [...reply.to, ...reply.cc].join(', ')
 }

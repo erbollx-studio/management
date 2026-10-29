@@ -85,9 +85,11 @@ export function parseAddressList(s: string): Address[] {
 
 /** Free mail providers: muting "everyone at gmail.com" would mute half the world. */
 const PUBLIC_DOMAINS = new Set([
-  'gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'icloud.com',
-  'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'mail.ru', 'bk.ru', 'inbox.ru', 'list.ru', 'yandex.ru',
-  'yandex.com', 'ya.ru', 'gmx.com',
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com', 'rocketmail.com', 'yahoo.co.uk', 'yahoo.ca',
+  'outlook.com', 'hotmail.com', 'hotmail.co.uk', 'live.com', 'msn.com', 'icloud.com', 'me.com', 'mac.com',
+  'aol.com', 'att.net', 'sbcglobal.net', 'bellsouth.net', 'comcast.net', 'verizon.net', 'cox.net', 'charter.net',
+  'earthlink.net', 'proton.me', 'protonmail.com', 'zoho.com', 'mail.com', 'gmx.com', 'gmx.de', 'web.de',
+  'mail.ru', 'bk.ru', 'inbox.ru', 'list.ru', 'yandex.ru', 'yandex.com', 'ya.ru', 'rambler.ru',
 ])
 
 /** The sender's company domain, or null for free mail providers. */
@@ -116,17 +118,17 @@ export function subjectKey(subject: string): string {
  */
 export function isMuted(muted: string[], email: string, subject = ''): boolean {
   return muted.some((m) => {
-    if (m.includes(' :: ')) {
-      const [sender, key] = m.split(' :: ')
-      return email === sender && subjectKey(subject) === key
-    }
-    return m.includes('@') ? email === m : email.endsWith('@' + m) || email.endsWith('.' + m)
+    if (m === email) return true
+    const cut = m.indexOf(' :: ')
+    if (cut >= 0) return email === m.slice(0, cut) && subjectKey(subject) === m.slice(cut + 4)
+    return !m.includes('@') && (email.endsWith('@' + m) || email.endsWith('.' + m))
   })
 }
 
 /** The mute entry for a 🔕 choice: s = this sender, d = their company, t = emails like this one. */
 export function muteEntry(email: Email, kind: string): string | null {
   const sender = email.from.email
+  if (!sender) return null
   if (kind === 's') return sender
   if (kind === 'd') return companyDomain(sender)
   if (kind === 't') return sender + ' :: ' + subjectKey(email.subject)
@@ -135,10 +137,8 @@ export function muteEntry(email: Email, kind: string): string | null {
 
 /** A mute entry in words, for /muted and the 🔕 confirmation. */
 export function describeMute(entry: string): string {
-  if (entry.includes(' :: ')) {
-    const [sender, key] = entry.split(' :: ')
-    return 'emails like "' + key + '" from ' + sender
-  }
+  const cut = entry.indexOf(' :: ')
+  if (cut >= 0) return 'emails like "' + entry.slice(cut + 4) + '" from ' + entry.slice(0, cut)
   return entry.includes('@') ? entry : 'everyone at ' + entry
 }
 
@@ -430,12 +430,12 @@ export function cardText(
   o: { inbox: string; email: Email; link: string; timeZone: string; tags?: string[]; body?: string },
 ): string {
   const { email } = o
-  const head = '<a href="' + esc(o.link) + '"><b>' + esc(email.from.label) + '</b></a> → ' + esc(o.inbox)
+  const head = '<a href="' + esc(o.link) + '"><b>' + esc(clip(email.from.label, 80)) + '</b></a> → ' + esc(o.inbox)
   if (o.body === undefined) return head
   const lines = [
     head,
     '<b>' + esc(clip(email.subject || '(no subject)', 300)) + '</b>',
-    fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(o.tags.join(', ')) : ''),
+    fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(clip(o.tags.join(', '), 200)) : ''),
   ]
   if (o.body) lines.push('', esc(o.body))
   return lines.join('\n')

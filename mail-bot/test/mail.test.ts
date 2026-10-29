@@ -220,6 +220,16 @@ Deno.test('🔕 "emails like this" ignores numbers, dates and Re:, and only that
   assert.equal(muteEntry(e, 's'), 'no-reply@mail.anthropic.com')
   assert.equal(muteEntry(e, 'd'), 'mail.anthropic.com')
   assert.equal(describeMute('aladdincap.com'), 'everyone at aladdincap.com')
+  // A subject with " :: " in it still works, and so does a sender without an @.
+  e.from = parseAddress('reports@factor.com')
+  e.subject = 'Weekly :: report 12'
+  const odd = muteEntry(e, 't')!
+  assert.ok(isMuted([odd], 'reports@factor.com', 'Weekly :: report 13'))
+  assert.equal(describeMute(odd), 'emails like "weekly :: report #" from reports@factor.com')
+  assert.ok(isMuted(['undisclosed-recipients'], 'undisclosed-recipients'))
+  e.from = parseAddress('')
+  assert.equal(muteEntry(e, 's'), null)
+  assert.equal(companyDomain('x@sbcglobal.net'), null)
   assert.equal(describeMute(entry), 'emails like "your secure link to claude.ai is here | #-#-# #:#:#" from no-reply@mail.anthropic.com')
 })
 
