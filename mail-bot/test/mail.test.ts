@@ -21,6 +21,7 @@ import {
   readEmail,
   refFromEntities,
   parseRules,
+  preview,
   shouldSkip,
   similarWords,
 } from '../supabase/functions/mail-bot/mail.ts'
@@ -153,23 +154,37 @@ Deno.test('mute matches an address or a whole domain, not lookalikes', () => {
   assert.ok(!isMuted(muted, 'team@cloudflare.com'))
 })
 
-Deno.test('the card is one line: sender → inbox, sender links to Gmail', () => {
+Deno.test('the card: sender → inbox, subject, the first lines; sender links to Gmail', () => {
   const e = readEmail(message())
   const link = 'https://mail.google.com/mail/u/info@jolgo.app/#all/' + e.id
-  const t = cardText({ inbox: 'info@jolgo.app', email: e, link, timeZone: 'Asia/Bishkek' })
-  assert.equal(t, '<a href="' + link + '"><b>Heather G</b></a> → info@jolgo.app')
+  const t = cardText({ inbox: 'info@jolgo.app', email: e, link, timeZone: 'Asia/Bishkek', body: preview(e, 300) })
+  assert.equal(t, [
+    '<a href="' + link + '"><b>Heather G</b></a> → info@jolgo.app',
+    '<b>FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</b>',
+    'Hi Erbol, FTP details attached.',
+  ].join('\n'))
   assert.deepEqual(refFromEntities([{ type: 'text_link', url: link }]), { inbox: 'info@jolgo.app', id: e.id })
 })
 
-Deno.test('▾ More adds subject, time, matched words and the text, all escaped', () => {
+Deno.test('the first lines: quotes cut, one paragraph, clipped; the snippet when there is no text', () => {
+  const long = readEmail(message({ payload: { mimeType: 'text/plain', body: { data: b64('Hello team,\n\n' + 'word '.repeat(100)) } } }))
+  const p = preview(long, 300)
+  assert.ok(p.startsWith('Hello team, word word'), p)
+  assert.ok(p.length <= 302 && p.endsWith(' …'), p)
+  const empty = readEmail(message({ snippet: 'Your invoice &amp; receipt', payload: { mimeType: 'text/plain' } }))
+  assert.equal(preview(empty, 300), 'Your invoice & receipt')
+})
+
+Deno.test('▾ More adds time, matched words and the text, all escaped', () => {
   const e = readEmail(message())
   const t = cardText({
-    inbox: 'info@jolgo.app', email: e, link: 'x', timeZone: 'Asia/Bishkek', tags: ['invoice'], body: readableBody(e, true),
+    inbox: 'info@jolgo.app', email: e, link: 'x', timeZone: 'Asia/Bishkek', details: true, tags: ['invoice'],
+    body: readableBody(e, true),
   })
   const lines = t.split('\n')
   assert.equal(lines[1], '<b>FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</b>')
   assert.equal(lines[2], '26 Oct, 14:32 · 🏷 invoice')
-  assert.ok(t.endsWith('Hi Erbol,\n\nFTP details attached.'), t)
+  assert.ok(t.endsWith('26 Oct, 14:32 · 🏷 invoice\n\nHi Erbol,\n\nFTP details attached.'), t)
 })
 
 Deno.test('a reply target needs exactly one email link', () => {

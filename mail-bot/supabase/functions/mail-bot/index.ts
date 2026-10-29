@@ -16,6 +16,7 @@ import {
   matchRules,
   muteEntry,
   parseRules,
+  preview,
   readableBody,
   readEmail,
   refFromEntities,
@@ -28,9 +29,10 @@ import {
 
 /**
  * Mail bot: posts new mail from every connected inbox to one Telegram chat and
- * acts on it from there. Each email arrives as a one-line card ("Sender →
- * inbox"); ▾ More shows it, 🗑 removes it from the chat, 🔕 stops emails like
- * it. Each inbox connects with Google sign-in; nothing is forwarded anywhere.
+ * acts on it from there. Each email arrives as a short card ("Sender → inbox",
+ * the subject, the first lines); ▾ More shows the rest, 🗑 removes it from the
+ * chat, 🔕 stops emails like it. Each inbox connects with Google sign-in;
+ * nothing is forwarded anywhere.
  *
  * Routes. verify_jwt is off because Telegram and Google call in without a
  * Supabase JWT, so every route checks its own secret:
@@ -62,6 +64,7 @@ const REPLY_HEADERS = ['From', 'Reply-To', 'To', 'Cc', 'Subject', 'Message-ID', 
 
 const SKIP_CATEGORIES = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL']
 const SKIP_QUERY = '-category:promotions -category:social'
+const CARD_CHARS = 300
 const PREVIEW_CHARS = 1200
 const FULL_CHARS = 3300
 const MAX_EMAILS_PER_RUN = 15
@@ -88,7 +91,7 @@ const HELP = [
   '/pause, /resume: stop or restart notifications',
   '/status: is everything working',
   '',
-  'On an email: ▾ More reads it, 🗑 removes it from this chat (it stays in Gmail), 🔕 stops emails like it.',
+  'On an email: ▾ More shows the rest, 🗑 removes it from this chat (it stays in Gmail), 🔕 stops emails like it.',
   'To answer an email, use Telegram\'s Reply on it and type your answer. I show you the reply before it goes out.',
 ].join('\n')
 
@@ -479,12 +482,14 @@ async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz:
 
 function cardFor(ib: Inbox, email: Email, tz: string, view: View): string {
   const base = { inbox: ib.label || ib.email, email, link: gmailLink(ib.email, email.id), timeZone: tz }
-  if (view === 'min') return cardText(base)
+  if (view === 'min') return cardText({ ...base, body: preview(email, CARD_CHARS) })
   const tags = matchRules(email, ib.keywords).tags
-  if (view === 'more') return cardText({ ...base, tags, body: clip(readableBody(email, true), PREVIEW_CHARS) })
+  if (view === 'more') {
+    return cardText({ ...base, details: true, tags, body: clip(readableBody(email, true), PREVIEW_CHARS) })
+  }
   const full = readableBody(email, false)
   const body = full.length > FULL_CHARS ? clip(full, FULL_CHARS) + '\n\n(the rest is in Gmail: ↗ Gmail)' : full
-  return cardText({ ...base, tags, body })
+  return cardText({ ...base, details: true, tags, body })
 }
 
 function cardButtons(ib: Inbox, email: Email, view: View): { inline_keyboard: Button[][] } {

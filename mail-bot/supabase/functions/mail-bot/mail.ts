@@ -421,23 +421,30 @@ export function refFromEntities(entities: { type: string; url?: string }[] | und
   return refs.size === 1 ? [...refs.values()][0] : null
 }
 
+/** The start of an email as one short paragraph, for the card that arrives. */
+export function preview(email: Email, n: number): string {
+  return clip((readableBody(email, true) || email.snippet).replace(/\s+/g, ' ').trim(), n)
+}
+
 /**
- * An email card. Without `body` it is the minimal one-liner "Sender → inbox";
- * with it, the subject, time, matched filter words and the text follow. The
- * sender links to the email in Gmail, and the reply flow reads that link back.
+ * An email card: "Sender → inbox", the subject, then `body`. The card that
+ * arrives is just that; with `details` (▾ More) the time and the filter words
+ * that matched come before the text. The sender links to the email in Gmail,
+ * and the reply flow reads that link back.
  */
 export function cardText(
-  o: { inbox: string; email: Email; link: string; timeZone: string; tags?: string[]; body?: string },
+  o: { inbox: string; email: Email; link: string; timeZone: string; body: string; details?: boolean; tags?: string[] },
 ): string {
   const { email } = o
-  const head = '<a href="' + esc(o.link) + '"><b>' + esc(clip(email.from.label, 80)) + '</b></a> → ' + esc(o.inbox)
-  if (o.body === undefined) return head
   const lines = [
-    head,
+    '<a href="' + esc(o.link) + '"><b>' + esc(clip(email.from.label, 80)) + '</b></a> → ' + esc(o.inbox),
     '<b>' + esc(clip(email.subject || '(no subject)', 300)) + '</b>',
-    fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(clip(o.tags.join(', '), 200)) : ''),
   ]
-  if (o.body) lines.push('', esc(o.body))
+  if (o.details) {
+    lines.push(fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(clip(o.tags.join(', '), 200)) : ''))
+    if (o.body) lines.push('')
+  }
+  if (o.body) lines.push(esc(o.body))
   return lines.join('\n')
 }
 

@@ -8,15 +8,17 @@ a minute.
 
 ## What an email looks like
 
-One line, no noise:
+Who sent it, to which inbox, the subject and the first lines:
 
 ```
 Heather G → info@dancargologisticsinc.com
+FactorGenie System & TMS Integration
+Hi Erbol, FTP details attached. Please confirm the setup by Friday …
 [▾ More] [🗑 Delete] [🔕 Stop]
 ```
 
-- **▾ More** opens the email in the same message: subject, time, the filter
-  words that matched, and the text. **▴ Less** folds it back.
+- **▾ More** opens the rest in the same message: the time, the filter words
+  that matched, and more of the text. **▴ Less** folds it back.
 - **📄 Full text** shows the whole text (long emails are cut; the rest is in Gmail).
 - **📎 N** sends the email's files. Files never come on their own.
 - **🗄 Archive** archives it in Gmail and removes it from the chat.
