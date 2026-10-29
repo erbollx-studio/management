@@ -81,10 +81,65 @@ export function parseAddressList(s: string): Address[] {
   return out.map((x) => x.trim()).filter(Boolean).map(parseAddress)
 }
 
-export function isMuted(muted: string[], email: string): boolean {
-  return muted.some((m) =>
-    m.includes('@') ? email === m : email.endsWith('@' + m) || email.endsWith('.' + m)
-  )
+// ------------------------------------------------------------------ mutes --
+
+/** Free mail providers: muting "everyone at gmail.com" would mute half the world. */
+const PUBLIC_DOMAINS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'icloud.com',
+  'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'mail.ru', 'bk.ru', 'inbox.ru', 'list.ru', 'yandex.ru',
+  'yandex.com', 'ya.ru', 'gmx.com',
+])
+
+/** The sender's company domain, or null for free mail providers. */
+export function companyDomain(email: string): string | null {
+  const domain = email.split('@')[1] ?? ''
+  return domain && !PUBLIC_DOMAINS.has(domain) ? domain : null
+}
+
+/**
+ * A subject with the parts that change from email to email taken out, so
+ * "Re: Your link | 2026-10-15 21:27" and "Your link | 2026-10-14 10:46" match.
+ */
+export function subjectKey(subject: string): string {
+  return subject.toLowerCase()
+    .replace(/^(\s*(re|fw|fwd|aw|ответ|пересл)\s*:\s*)+/i, '')
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+}
+
+/**
+ * Mute entries come in three kinds: "name@company.com" (one sender),
+ * "company.com" (everyone there) and "name@company.com :: subject key"
+ * (that sender's emails like one they sent before).
+ */
+export function isMuted(muted: string[], email: string, subject = ''): boolean {
+  return muted.some((m) => {
+    if (m.includes(' :: ')) {
+      const [sender, key] = m.split(' :: ')
+      return email === sender && subjectKey(subject) === key
+    }
+    return m.includes('@') ? email === m : email.endsWith('@' + m) || email.endsWith('.' + m)
+  })
+}
+
+/** The mute entry for a 🔕 choice: s = this sender, d = their company, t = emails like this one. */
+export function muteEntry(email: Email, kind: string): string | null {
+  const sender = email.from.email
+  if (kind === 's') return sender
+  if (kind === 'd') return companyDomain(sender)
+  if (kind === 't') return sender + ' :: ' + subjectKey(email.subject)
+  return null
+}
+
+/** A mute entry in words, for /muted and the 🔕 confirmation. */
+export function describeMute(entry: string): string {
+  if (entry.includes(' :: ')) {
+    const [sender, key] = entry.split(' :: ')
+    return 'emails like "' + key + '" from ' + sender
+  }
+  return entry.includes('@') ? entry : 'everyone at ' + entry
 }
 
 // --------------------------------------------------------------- reading --
@@ -342,7 +397,7 @@ export function clip(s: string, n: number): string {
 }
 
 export function fmtDate(d: Date, timeZone: string): string {
-  return new Intl.DateTimeFormat('ru-RU', {
+  return new Intl.DateTimeFormat('en-GB', {
     timeZone,
     day: 'numeric',
     month: 'short',
@@ -366,20 +421,23 @@ export function refFromEntities(entities: { type: string; url?: string }[] | und
   return refs.size === 1 ? [...refs.values()][0] : null
 }
 
+/**
+ * An email card. Without `body` it is the minimal one-liner "Sender → inbox";
+ * with it, the subject, time, matched filter words and the text follow. The
+ * sender links to the email in Gmail, and the reply flow reads that link back.
+ */
 export function cardText(
-  o: { inbox: string; email: Email; link: string; preview: string; timeZone: string; tags?: string[] },
+  o: { inbox: string; email: Email; link: string; timeZone: string; tags?: string[]; body?: string },
 ): string {
   const { email } = o
+  const head = '<a href="' + esc(o.link) + '"><b>' + esc(email.from.label) + '</b></a> → ' + esc(o.inbox)
+  if (o.body === undefined) return head
   const lines = [
-    '📥 <b>' + esc(o.inbox) + '</b>' + (o.tags?.length ? ' · 🏷 ' + esc(o.tags.join(', ')) : ''),
-    '👤 <b>' + esc(email.from.label) + '</b>' + (email.from.name ? ' ' + esc('<' + email.from.email + '>') : ''),
-    // The reply flow reads the inbox and Gmail ID back from this link.
-    '✉️ <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(без темы)', 300)) + '</a>',
-    '🕒 ' + fmtDate(email.date, o.timeZone),
+    head,
+    '<b>' + esc(clip(email.subject || '(no subject)', 300)) + '</b>',
+    fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(o.tags.join(', ')) : ''),
   ]
-  if (o.preview) lines.push('', esc(o.preview))
-  const n = email.attachments.length
-  if (n) lines.push('', '📎 Вложений: ' + n)
+  if (o.body) lines.push('', esc(o.body))
   return lines.join('\n')
 }
 
@@ -389,17 +447,38 @@ export interface Button {
   url?: string
 }
 
-export function emailKeyboard(inboxId: number, id: string, link: string, unread: boolean, archived: boolean): { inline_keyboard: Button[][] } {
+/** Buttons for a card: "min" is the one-liner, "more" shows the preview, "full" the whole text. */
+export function emailKeyboard(
+  inboxId: number,
+  id: string,
+  link: string,
+  view: 'min' | 'more' | 'full',
+  files = 0,
+): { inline_keyboard: Button[][] } {
   const ref = inboxId + ':' + id
-  const row: Button[] = []
-  if (unread && !archived) row.push({ text: '✅ Прочитано', callback_data: 'r:' + ref })
-  if (!archived) row.push({ text: '🗄 В архив', callback_data: 'a:' + ref })
-  row.push({ text: '📄 Весь текст', callback_data: 'f:' + ref })
+  const done: Button[] = [
+    { text: '🗑 Delete', callback_data: 'd:' + ref },
+    { text: '🔕 Stop', callback_data: 's:' + ref },
+  ]
+  if (view === 'min') return { inline_keyboard: [[{ text: '▾ More', callback_data: 'v:' + ref }, ...done]] }
+  const top: Button[] = [{ text: '▴ Less', callback_data: 'c:' + ref }]
+  if (view === 'more') top.push({ text: '📄 Full text', callback_data: 'f:' + ref })
+  if (files) top.push({ text: '📎 ' + files, callback_data: 'p:' + ref })
+  top.push({ text: '↗ Gmail', url: link })
+  return { inline_keyboard: [top, [{ text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
+}
+
+/** The 🔕 choices for one email. The company choice is left out for free mail providers. */
+export function stopKeyboard(inboxId: number, email: Email): { inline_keyboard: Button[][] } {
+  const ref = inboxId + ':' + email.id
+  const company = companyDomain(email.from.email)
   return {
-    inline_keyboard: [row, [
-      { text: '🔇 Заглушить', callback_data: 'm:' + ref },
-      { text: '↗️ Gmail', url: link },
-    ]],
+    inline_keyboard: [
+      [{ text: '🔕 This sender: ' + clip(email.from.email, 40), callback_data: 'M:' + ref + ':s' }],
+      ...(company ? [[{ text: '🔕 Everyone at ' + company, callback_data: 'M:' + ref + ':d' }]] : []),
+      [{ text: '🔕 Emails like this one', callback_data: 'M:' + ref + ':t' }],
+      [{ text: '‹ Back', callback_data: 'c:' + ref }],
+    ],
   }
 }
 

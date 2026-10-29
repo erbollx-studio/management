@@ -1,89 +1,106 @@
-# Бот: почта → Telegram
+# Mail → Telegram bot
 
-Вся рабочая почта в одном чате Telegram: **@emailsforerbol_bot**.
+All your work email in one Telegram chat: **@emailsforerbol_bot**.
 
-Каждая почта подключается через «Войти через Google». Ничего не пересылается.
-Когда в любую подключённую почту приходит письмо, бот присылает его в Telegram
-примерно за минуту. Прямо в Telegram можно:
+Each inbox connects with "Sign in with Google". Nothing is forwarded. When an
+email arrives in any connected inbox, the bot posts it to Telegram within about
+a minute.
 
-- **✅ Прочитано**: отметить письмо прочитанным в этой почте
-- **🗄 В архив**: убрать письмо в архив в этой почте
-- **📄 Весь текст**: показать письмо целиком
-- **📎 вложения**: приходят файлами под письмом
-- **🔇 Заглушить**: больше не показывать письма от этого отправителя
-- **Ответить**: нажми «Ответить» на письме в Telegram и напиши текст. Бот
-  сначала покажет ответ и отправит его только после кнопки **✅ Отправить**.
-  Ответ уходит с той почты, на которую пришло письмо.
+## What an email looks like
 
-Письма из вкладок «Промоакции» и «Соцсети» бот пропускает.
+One line, no noise:
 
-## Фильтры по словам
+```
+Heather G → info@dancargologisticsinc.com
+[▾ More] [🗑 Delete] [🔕 Stop]
+```
 
-Для любой почты можно задать свои слова. Тогда с этой почты в Telegram
-приходят только письма, где эти слова есть.
+- **▾ More** opens the email in the same message: subject, time, the filter
+  words that matched, and the text. **▴ Less** folds it back.
+- **📄 Full text** shows the whole text (long emails are cut; the rest is in Gmail).
+- **📎 N** sends the email's files. Files never come on their own.
+- **🗄 Archive** archives it in Gmail and removes it from the chat.
+- **🗑 Delete** removes it from the chat and marks it read in Gmail. The email
+  stays in Gmail.
+- **🔕 Stop** stops emails like it: from this sender, from everyone at that
+  company (not offered for gmail.com and other free mail), or "emails like
+  this one" (same sender, same subject apart from numbers and dates).
+- **Reply**: use Telegram's Reply on the email and type. The bot shows you the
+  reply first and sends it only after **✅ Send**. It goes out from the inbox
+  the email came to. Afterwards your typed text and the confirmation leave the
+  chat.
 
-- **Запятая** означает «любое из правил»: `payment, erbol`
-- **Плюс** означает «все слова сразу»: `payment + insurance`
-- Слово ищется везде: в теме, у отправителя, во всём тексте и в названиях
-  вложений. Регистр не важен, `payment` находит и `payments`.
-- **Похожие слова считаются сами.** `payment` находит и invoice, paid,
-  remittance, «оплата», «счёт». `insurance` находит и premium, COI,
-  «страховка». Списки похожих слов лежат в `FAMILIES` в `mail.ts`.
-- Отсеянные письма не теряются: каждый день в 20:00 бот присылает их список,
-  а `/skipped` показывает его сразу.
-- На письме видно, что сработало, например «🏷 invoice + premium».
+Other bot messages (files, lists, confirmations) have a 🗑 button too, so the
+chat stays clean. Emails in the Promotions and Social tabs are skipped.
 
-Без слов с почты приходят все письма.
+## Filters by words
 
-## Команды
+Any inbox can be limited to emails that contain certain words.
 
-| Команда | Что делает |
+- **Commas** mean "any rule": `payment, erbol`
+- **Plus** means "all words": `payment + insurance`
+- Words are searched everywhere: subject, sender, the whole text and file
+  names. Case doesn't matter, and `payment` also finds `payments`.
+- **Similar words count too.** `payment` also finds invoice, paid, remittance,
+  «оплата», «счёт»; `insurance` also finds premium, COI, «страховка». The lists
+  are `FAMILIES` in `mail.ts`.
+- Held-back emails aren't lost: the bot sends a list of them every day at
+  20:00 (Bishkek), and `/skipped` shows it any time.
+
+An inbox without words gets all its emails.
+
+## Commands
+
+| Command | What it does |
 |---|---|
-| `/connect` | Добавить почту (вход через Google) |
-| `/inboxes` | Список подключённых почт |
-| `/disconnect name@company.com` | Отключить почту |
-| `/unread` | 10 последних непрочитанных; нажми номер, чтобы открыть письмо |
-| `/filter` | Слова-фильтры: нажми на почту и напиши слова |
-| `/filter name@company.com payment, erbol` | То же одной командой; `все` убирает фильтр |
-| `/skipped` | Письма, которые фильтры отсеяли |
-| `/check` | Проверить все почты сейчас |
-| `/mute name@company.com` или `/mute company.com` | Не показывать письма от человека или целой компании |
-| `/unmute …`, `/muted` | Вернуть заглушённого, список заглушённых |
-| `/pause`, `/resume` | Выключить или включить уведомления |
-| `/status` | Всё ли работает |
+| `/connect` | Add an inbox (sign in with Google) |
+| `/inboxes` | Connected inboxes and their filters |
+| `/disconnect name@company.com` | Remove an inbox |
+| `/unread` | Newest 10 unread emails; tap a number to open one |
+| `/filter` | Filter by words: tap an inbox, type the words |
+| `/filter name@company.com payment, erbol` | The same in one command; `all` removes the filter |
+| `/skipped` | Emails the filters held back |
+| `/muted` | What you stopped with 🔕; tap one to undo |
+| `/check` | Check all inboxes now |
+| `/pause`, `/resume` | Stop or restart notifications |
+| `/status` | Is everything working |
 
-## Где работает
+## Where it runs
 
-В проекте Supabase **Task Manager** (`vqexlrqphddnnbveppbl`), рядом с синхронизацией
-календаря. Таблицы планировщика бот не трогает.
+In the Supabase project **Task Manager** (`vqexlrqphddnnbveppbl`), next to the
+calendar sync. It doesn't touch the planner tables.
 
-- `supabase/functions/mail-bot/index.ts`: сам бот (приём сообщений из Telegram,
-  вход через Google, проверка почты раз в минуту)
-- `supabase/functions/mail-bot/mail.ts`: разбор писем и сборка ответов
-- `supabase/migrations/`: таблицы `mailbot_*`, хранилище доступов (Vault), расписание проверки
+- `supabase/functions/mail-bot/index.ts`: the bot (Telegram webhook, Google
+  sign-in, the once-a-minute check, the daily list)
+- `supabase/functions/mail-bot/mail.ts`: reading emails, filters, mutes,
+  cards and replies
+- `supabase/migrations/`: the `mailbot_*` tables, token storage in Vault, the
+  scheduled jobs
 
-Бот использует то же приложение для входа через Google, что и календарь
-(`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`). В этом проекте Google Cloud нужно:
+It uses the Google sign-in app the calendar sync already has
+(`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`). That Google Cloud project needs:
 
-1. Включить **Gmail API**.
-2. Добавить этот адрес в **Authorized redirect URIs** у OAuth-клиента:
+1. The **Gmail API** turned on.
+2. This address in the OAuth client's **Authorized redirect URIs**:
    `https://vqexlrqphddnnbveppbl.supabase.co/functions/v1/mail-bot/callback`
 
-Секретов в этом репозитории нет. Токен бота и доступы к почтам лежат в Supabase
-Vault (зашифрованное хранилище). Секрет для Telegram, ключ для расписания и код
-привязки создаются миграцией и лежат в `mailbot_config`.
+No secrets are in this repo. The bot token and the Google tokens are in
+Supabase Vault (encrypted storage). The Telegram secret, the schedule key and
+the pairing code are made by the migration and kept in `mailbot_config`.
 
-Проверка, что бот жив (без личных данных): `GET …/functions/v1/mail-bot/health`
+Health check (no private data): `GET …/functions/v1/mail-bot/health`
 
-## Тесты
+## Tests
 
 ```
 deno test mail-bot/test/
 ```
 
-## Ограничения
+## Limits
 
-- Только Gmail и Google Workspace. Для Outlook нужно отдельное приложение Microsoft.
-- Если Google не открывается внутри Telegram, скопируй ссылку из `/connect` в Safari или Chrome.
-- Вложения больше 20 МБ приходят ссылкой на Gmail, а не файлом.
-- Ответы только текстом.
+- Gmail and Google Workspace only. Outlook would need a Microsoft sign-in app.
+- If Google won't open inside Telegram, copy the `/connect` link into Safari or Chrome.
+- Telegram lets bots delete messages for 48 hours. After that, 🗑 shrinks the
+  message to "✓" instead.
+- Files over 20 MB get a Gmail link instead.
+- Replies are plain text.

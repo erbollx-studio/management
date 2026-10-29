@@ -2,7 +2,12 @@
 import assert from 'node:assert/strict'
 import {
   base64urlToBytes,
+  companyDomain,
+  describeMute,
   findWord,
+  muteEntry,
+  stopKeyboard,
+  subjectKey,
   buildReply,
   bytesToBase64url,
   cardText,
@@ -148,15 +153,23 @@ Deno.test('mute matches an address or a whole domain, not lookalikes', () => {
   assert.ok(!isMuted(muted, 'team@cloudflare.com'))
 })
 
-Deno.test('the card escapes HTML and carries the inbox + id in its link', () => {
+Deno.test('the card is one line: sender → inbox, sender links to Gmail', () => {
   const e = readEmail(message())
   const link = 'https://mail.google.com/mail/u/info@jolgo.app/#all/' + e.id
-  const t = cardText({ inbox: 'info@jolgo.app', email: e, link, preview: readableBody(e, true), timeZone: 'Asia/Bishkek' })
-  assert.ok(t.startsWith('📥 <b>info@jolgo.app</b>\n👤 <b>Heather G</b> &lt;heatherg@aladdincap.com&gt;'), t)
-  assert.ok(t.includes('<a href="' + link + '">FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</a>'), t)
-  assert.ok(t.includes('🕒 26 окт., 14:32'), t)
-  assert.ok(t.endsWith('📎 Вложений: 1'), t)
+  const t = cardText({ inbox: 'info@jolgo.app', email: e, link, timeZone: 'Asia/Bishkek' })
+  assert.equal(t, '<a href="' + link + '"><b>Heather G</b></a> → info@jolgo.app')
   assert.deepEqual(refFromEntities([{ type: 'text_link', url: link }]), { inbox: 'info@jolgo.app', id: e.id })
+})
+
+Deno.test('▾ More adds subject, time, matched words and the text, all escaped', () => {
+  const e = readEmail(message())
+  const t = cardText({
+    inbox: 'info@jolgo.app', email: e, link: 'x', timeZone: 'Asia/Bishkek', tags: ['invoice'], body: readableBody(e, true),
+  })
+  const lines = t.split('\n')
+  assert.equal(lines[1], '<b>FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</b>')
+  assert.equal(lines[2], '26 Oct, 14:32 · 🏷 invoice')
+  assert.ok(t.endsWith('Hi Erbol,\n\nFTP details attached.'), t)
 })
 
 Deno.test('a reply target needs exactly one email link', () => {
@@ -168,13 +181,46 @@ Deno.test('a reply target needs exactly one email link', () => {
   assert.equal(refFromEntities(undefined), null)
 })
 
-Deno.test('callback data stays under Telegram\'s 64-byte limit', () => {
-  const kb = emailKeyboard(99999, '18f0a1b2c3d4e5f6a7b8', 'https://mail.google.com/x', true, false)
-  for (const btn of kb.inline_keyboard.flat()) {
-    if (btn.callback_data) assert.ok(new TextEncoder().encode(btn.callback_data).length <= 64, btn.callback_data)
+Deno.test('buttons: one row when small, more when open; callback data under 64 bytes', () => {
+  const id = '18f0a1b2c3d4e5f6a7b8'
+  const data = (kb: { inline_keyboard: { callback_data?: string; text: string }[][] }) =>
+    kb.inline_keyboard.flat().map((b) => b.callback_data ?? 'url')
+  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'min', 2)), ['v:7:' + id, 'd:7:' + id, 's:7:' + id])
+  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'more', 2)),
+    ['c:7:' + id, 'f:7:' + id, 'p:7:' + id, 'url', 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'full', 0)), ['c:7:' + id, 'url', 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+  const e = readEmail(message({ id }))
+  for (const kb of [emailKeyboard(99999, id, 'u', 'more', 9), stopKeyboard(99999, e)]) {
+    for (const d of data(kb)) assert.ok(new TextEncoder().encode(d).length <= 64, d)
   }
-  const done = emailKeyboard(1, 'a1', 'u', false, true)
-  assert.deepEqual(done.inline_keyboard[0].map((btn) => btn.callback_data), ['f:1:a1'])
+})
+
+Deno.test('🔕 choices: sender, company (not for gmail.com), emails like this', () => {
+  const e = readEmail(message())
+  assert.deepEqual(stopKeyboard(3, e).inline_keyboard.map((r) => r[0].callback_data),
+    ['M:3:' + e.id + ':s', 'M:3:' + e.id + ':d', 'M:3:' + e.id + ':t', 'c:3:' + e.id])
+  e.from = parseAddress('Friend <friend@gmail.com>')
+  assert.deepEqual(stopKeyboard(3, e).inline_keyboard.map((r) => r[0].callback_data),
+    ['M:3:' + e.id + ':s', 'M:3:' + e.id + ':t', 'c:3:' + e.id])
+  assert.equal(companyDomain('a@gmail.com'), null)
+  assert.equal(companyDomain('a@aladdincap.com'), 'aladdincap.com')
+})
+
+Deno.test('🔕 "emails like this" ignores numbers, dates and Re:, and only that sender', () => {
+  assert.equal(subjectKey('Re: Your secure link to Claude.ai is here | 2026-10-15 21:27:38'),
+    subjectKey('Your secure link to Claude.ai is here | 2026-10-14 10:46:15'))
+  assert.notEqual(subjectKey('Settlement Report -- for AAJ COM'), subjectKey('Over Advance Details'))
+  const e = readEmail(message())
+  e.from = parseAddress('no-reply@mail.anthropic.com')
+  e.subject = 'Your secure link to Claude.ai is here | 2026-10-14 10:46:15'
+  const entry = muteEntry(e, 't')!
+  assert.ok(isMuted([entry], 'no-reply@mail.anthropic.com', 'Your secure link to Claude.ai is here | 2026-10-29 08:00:00'))
+  assert.ok(!isMuted([entry], 'no-reply@mail.anthropic.com', '$100 USD in API credits was added'))
+  assert.ok(!isMuted([entry], 'other@mail.anthropic.com', 'Your secure link to Claude.ai is here | 2026-10-29 08:00:00'))
+  assert.equal(muteEntry(e, 's'), 'no-reply@mail.anthropic.com')
+  assert.equal(muteEntry(e, 'd'), 'mail.anthropic.com')
+  assert.equal(describeMute('aladdincap.com'), 'everyone at aladdincap.com')
+  assert.equal(describeMute(entry), 'emails like "your secure link to claude.ai is here | #-#-# #:#:#" from no-reply@mail.anthropic.com')
 })
 
 Deno.test('reply threads correctly; reply-all drops yourself and duplicates', () => {
@@ -273,8 +319,3 @@ Deno.test('the whole email counts; no rules means everything; snippet stands in 
   assert.equal(matchRules(e, ['tax']).pass, false)
 })
 
-Deno.test('the card shows why a filtered email came through', () => {
-  const e = readEmail(message())
-  const t = cardText({ inbox: 'info@jolgo.app', email: e, link: 'x', preview: '', timeZone: 'Asia/Bishkek', tags: ['payment'] })
-  assert.ok(t.startsWith('📥 <b>info@jolgo.app</b> · 🏷 payment\n'), t)
-})

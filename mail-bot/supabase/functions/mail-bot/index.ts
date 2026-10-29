@@ -6,6 +6,7 @@ import {
   cardText,
   clip,
   decodeEntities,
+  describeMute,
   type Email,
   emailKeyboard,
   esc,
@@ -13,27 +14,30 @@ import {
   gmailLink,
   isMuted,
   matchRules,
+  muteEntry,
   parseRules,
   readableBody,
   readEmail,
   refFromEntities,
   shouldSkip,
   similarWords,
+  stopKeyboard,
   type Attachment,
   type Button,
 } from './mail.ts'
 
 /**
  * Mail bot: posts new mail from every connected inbox to one Telegram chat and
- * acts on it from there (read, archive, full text, attachments, mute, reply).
- * Each inbox connects with Google sign-in; nothing is forwarded anywhere.
+ * acts on it from there. Each email arrives as a one-line card ("Sender →
+ * inbox"); ▾ More shows it, 🗑 removes it from the chat, 🔕 stops emails like
+ * it. Each inbox connects with Google sign-in; nothing is forwarded anywhere.
  *
  * Routes. verify_jwt is off because Telegram and Google call in without a
  * Supabase JWT, so every route checks its own secret:
  *   POST /telegram  Telegram webhook, checked against X-Telegram-Bot-Api-Secret-Token
  *   GET  /connect   short link from /connect that redirects to Google's consent screen
  *   GET  /callback  Google's OAuth redirect
- *   POST /cron      pg_cron once a minute, bearer token from mailbot_config
+ *   POST /cron      pg_cron: {} once a minute, {"job":"digest"} once a day
  *   GET  /health    public liveness, counts only
  *
  * GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are the project secrets the
@@ -59,6 +63,7 @@ const REPLY_HEADERS = ['From', 'Reply-To', 'To', 'Cc', 'Subject', 'Message-ID', 
 const SKIP_CATEGORIES = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL']
 const SKIP_QUERY = '-category:promotions -category:social'
 const PREVIEW_CHARS = 1200
+const FULL_CHARS = 3300
 const MAX_EMAILS_PER_RUN = 15
 const MAX_ATTACHMENTS = 10
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -67,26 +72,30 @@ const DEFAULT_TIME_ZONE = 'Asia/Bishkek'
 const FILTER_WAIT_MS = 10 * 60_000
 const DIGEST_ITEMS = 20
 
+/** A 🗑 button for messages that are not email cards (files, lists, confirmations). */
+const TRASH = { inline_keyboard: [[{ text: '🗑', callback_data: 'X' }]] }
+
 const HELP = [
-  '<b>Команды</b>',
-  '/connect: добавить почту (вход через Google)',
-  '/inboxes: подключённые почты',
-  '/disconnect name@company.com: отключить почту',
-  '/unread: последние непрочитанные письма',
-  '/filter: присылать только письма с нужными словами (payment, erbol, payment + insurance)',
-  '/skipped: письма, которые фильтры не пропустили',
-  '/check: проверить все почты прямо сейчас',
-  '/mute name@company.com или company.com: не показывать письма от человека или компании',
-  '/unmute, /muted: вернуть или посмотреть заглушённых',
-  '/pause, /resume: выключить или включить уведомления',
-  '/status: всё ли работает',
+  '<b>Commands</b>',
+  '/connect: add an inbox (sign in with Google)',
+  '/inboxes: connected inboxes',
+  '/disconnect name@company.com: remove an inbox',
+  '/unread: latest unread emails',
+  '/filter: only get emails with certain words (payment, erbol, payment + insurance)',
+  '/skipped: emails your filters held back',
+  '/muted: what you stopped with 🔕, tap to undo',
+  '/check: check all inboxes now',
+  '/pause, /resume: stop or restart notifications',
+  '/status: is everything working',
   '',
-  'Чтобы ответить на письмо, нажми «Ответить» на нём в Telegram и напиши текст. Я покажу ответ перед отправкой.',
+  'On an email: ▾ More reads it, 🗑 removes it from this chat (it stays in Gmail), 🔕 stops emails like it.',
+  'To answer an email, use Telegram\'s Reply on it and type your answer. I show you the reply before it goes out.',
 ].join('\n')
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
 type Config = Record<string, string>
+type View = 'min' | 'more' | 'full'
 
 interface Inbox {
   id: number
@@ -169,7 +178,7 @@ async function connectedInboxes(): Promise<Inbox[]> {
 
 async function inboxById(id: number): Promise<Inbox> {
   const { data } = await db.from('mailbot_inboxes').select('*').eq('id', id).maybeSingle()
-  if (!data) throw new Error('эта почта больше не подключена')
+  if (!data) throw new Error('that inbox is no longer connected')
   return data as Inbox
 }
 
@@ -204,7 +213,8 @@ async function tg(method: string, payload: Record<string, unknown> | FormData): 
       await sleep(Math.min(body.parameters?.retry_after ?? 1, 10) * 1000)
       continue
     }
-    if (!body.ok) console.error('telegram', method, body.description)
+    // "message is not modified" just means a button was tapped twice.
+    if (!body.ok && !/not modified/i.test(body.description ?? '')) console.error('telegram', method, body.description)
     return body
   }
 }
@@ -225,6 +235,23 @@ async function send(chat: string, text: string, markup?: unknown, replyTo?: numb
     res = await tg('sendMessage', payload)
   }
   return res
+}
+
+async function edit(chat: string | number, messageId: number, text: string, markup?: unknown): Promise<TgResult> {
+  return await tg('editMessageText', {
+    chat_id: chat,
+    message_id: messageId,
+    text,
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: markup ?? { inline_keyboard: [] },
+  })
+}
+
+/** Telegram lets bots delete messages for 48 hours; after that the message is shrunk to `fallback`. */
+async function remove(chat: string | number, messageId: number, fallback = '✓'): Promise<void> {
+  const res = await tg('deleteMessage', { chat_id: chat, message_id: messageId })
+  if (!res.ok) await edit(chat, messageId, fallback)
 }
 
 /** A Telegram refusal that retrying won't fix (bad request) versus one worth another try. */
@@ -276,7 +303,7 @@ async function accessToken(ib: Inbox, chat?: string): Promise<string> {
     return ib.access_token
   }
   const { data: refresh } = await db.rpc('mailbot_read_refresh_token', { p_inbox_id: ib.id })
-  if (!refresh) throw new Error('нет сохранённого доступа для ' + ib.email)
+  if (!refresh) throw new Error('no refresh token stored for ' + ib.email)
   const t = await postToken({
     client_id: GOOGLE_CLIENT_ID,
     client_secret: GOOGLE_CLIENT_SECRET,
@@ -289,11 +316,11 @@ async function accessToken(ib: Inbox, chat?: string): Promise<string> {
         .eq('id', ib.id)
       ib.status = 'needs_reauth'
       if (chat) {
-        await send(chat, '⚠️ Google отключил <b>' + esc(ib.email) + '</b> (доступ отозван или сменён пароль). ' +
-          'Отправь /connect, чтобы войти снова.')
+        await send(chat, '⚠️ Google signed out <b>' + esc(ib.email) + '</b> (access removed or password changed). ' +
+          'Send /connect to sign it in again.')
       }
     }
-    throw new Error('не удалось обновить доступ для ' + ib.email + ': ' + (t.error ?? 'unknown'))
+    throw new Error('token refresh failed for ' + ib.email + ': ' + (t.error ?? 'unknown'))
   }
   ib.access_token = t.access_token
   ib.access_token_expires_at = new Date(Date.now() + (Number(t.expires_in) || 3600) * 1000).toISOString()
@@ -318,6 +345,10 @@ async function gmail(ib: Inbox, path: string, body?: unknown, chat?: string): Pr
   return res.status === 204 ? {} : await res.json()
 }
 
+async function fetchEmail(ib: Inbox, id: string): Promise<Email> {
+  return readEmail(await gmail(ib, `messages/${id}?format=full`))
+}
+
 // ---------------------------------------------------------------- polling --
 
 async function pollAll(cfg: Config): Promise<number> {
@@ -334,7 +365,7 @@ async function pollAll(cfg: Config): Promise<number> {
         .eq('id', ib.id)
       // Told once when an inbox starts failing; /status shows it until it recovers.
       if (!ib.last_error && ib.status === 'connected') {
-        await send(chat, '⚠️ Не получилось проверить <b>' + esc(ib.email) + '</b>: ' + esc(message))
+        await send(chat, '⚠️ Couldn\'t check <b>' + esc(ib.email) + '</b>: ' + esc(message))
       }
       return 0
     }
@@ -424,9 +455,8 @@ async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz:
   const email = readEmail(await gmail(ib, `messages/${id}?format=full`, undefined, chat))
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
-  if (isMuted(muted, email.from.email)) return false
-  const filter = matchRules(email, ib.keywords)
-  if (!filter.pass) {
+  if (isMuted(muted, email.from.email, email.subject)) return false
+  if (!matchRules(email, ib.keywords).pass) {
     // Held back, not lost: the daily digest and /skipped list these.
     await db.from('mailbot_skipped').upsert({
       inbox_id: ib.id,
@@ -437,47 +467,69 @@ async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz:
     })
     return false
   }
-  await postEmail(ib, email, chat, tz, filter.tags)
+  await postCard(ib, email, chat, tz, 'min')
   return true
 }
 
-async function postEmail(ib: Inbox, email: Email, chat: string, tz: string, tags: string[] = []): Promise<void> {
-  const link = gmailLink(ib.email, email.id)
-  const text = cardText({
-    inbox: ib.label || ib.email,
-    email,
-    link,
-    preview: clip(readableBody(email, true), PREVIEW_CHARS),
-    timeZone: tz,
-    tags,
-  })
-  const res = await send(chat, text, emailKeyboard(ib.id, email.id, link, email.labelIds.includes('UNREAD'), false))
+// ------------------------------------------------------------------ cards --
+
+function cardFor(ib: Inbox, email: Email, tz: string, view: View): string {
+  const base = { inbox: ib.label || ib.email, email, link: gmailLink(ib.email, email.id), timeZone: tz }
+  if (view === 'min') return cardText(base)
+  const tags = matchRules(email, ib.keywords).tags
+  if (view === 'more') return cardText({ ...base, tags, body: clip(readableBody(email, true), PREVIEW_CHARS) })
+  const full = readableBody(email, false)
+  const body = full.length > FULL_CHARS ? clip(full, FULL_CHARS) + '\n\n(the rest is in Gmail: ↗ Gmail)' : full
+  return cardText({ ...base, tags, body })
+}
+
+function cardButtons(ib: Inbox, email: Email, view: View): { inline_keyboard: Button[][] } {
+  return emailKeyboard(ib.id, email.id, gmailLink(ib.email, email.id), view,
+    Math.min(email.attachments.length, MAX_ATTACHMENTS))
+}
+
+async function postCard(ib: Inbox, email: Email, chat: string, tz: string, view: View): Promise<void> {
+  const res = await send(chat, cardFor(ib, email, tz, view), cardButtons(ib, email, view))
   if (!res.ok) throw new TelegramError(res)
+}
+
+// deno-lint-ignore no-explicit-any
+async function showCard(q: any, ib: Inbox, id: string, view: View, cfg: Config): Promise<void> {
+  const email = await fetchEmail(ib, id)
+  await edit(q.message.chat.id, q.message.message_id, cardFor(ib, email, cfg.time_zone || DEFAULT_TIME_ZONE, view),
+    cardButtons(ib, email, view))
+}
+
+/** 📎: the files of one email, each as a document with its own 🗑. */
+async function sendFiles(chat: string, ib: Inbox, id: string, replyTo: number): Promise<void> {
+  const email = await fetchEmail(ib, id)
+  const link = gmailLink(ib.email, email.id)
   for (const file of email.attachments.slice(0, MAX_ATTACHMENTS)) {
     try {
-      await sendAttachment(ib, email, file, link, chat, res.result.message_id)
+      await sendAttachment(ib, email, file, link, chat, replyTo)
     } catch (e) {
       console.error('attachment', file.name, e)
-      await send(chat, '📎 Не получилось отправить ' + esc(file.name) + '. <a href="' + esc(link) + '">Открыть в Gmail</a>',
-        undefined, res.result.message_id)
+      await send(chat, '📎 Couldn\'t send ' + esc(file.name) + '. <a href="' + esc(link) + '">Open in Gmail</a>',
+        TRASH, replyTo)
     }
   }
 }
 
 async function sendAttachment(ib: Inbox, email: Email, file: Attachment, link: string, chat: string, replyTo: number) {
   if (file.size > MAX_ATTACHMENT_BYTES) {
-    await send(chat, '📎 ' + esc(file.name) + ': ' + Math.round(file.size / 1048576) + ' МБ, слишком большой для Telegram. ' +
-      '<a href="' + esc(link) + '">Открыть в Gmail</a>', undefined, replyTo)
+    await send(chat, '📎 ' + esc(file.name) + ' is ' + Math.round(file.size / 1048576) + ' MB, too big for Telegram. ' +
+      '<a href="' + esc(link) + '">Open in Gmail</a>', TRASH, replyTo)
     return
   }
   const data = file.data ?? (await gmail(ib, `messages/${email.id}/attachments/${file.attachmentId}`)).data
   const form = new FormData()
   form.set('chat_id', chat)
   form.set('document', new Blob([base64urlToBytes(data)], { type: file.mimeType }), file.name)
-  // The caption link lets you reply to an attachment just like to its email.
+  // The caption link lets you reply to a file just like to its email.
   form.set('caption', '📎 <a href="' + esc(link) + '">' + esc(file.name) + '</a>')
   form.set('parse_mode', 'HTML')
   form.set('reply_parameters', JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true }))
+  form.set('reply_markup', JSON.stringify(TRASH))
   const res = await tg('sendDocument', form)
   if (!res.ok) throw new TelegramError(res)
 }
@@ -503,8 +555,8 @@ async function onUpdate(cfg: Config, u: any): Promise<void> {
     if (code && cfg.pair_code && code === cfg.pair_code) {
       await setConfig('owner_chat_id', chat)
       await db.from('mailbot_config').delete().eq('key', 'pair_code')
-      await send(chat, '✅ Бот теперь твой.\n\nДобавь свои почты: отправь /connect, войди в одну почту ' +
-        'и повтори для каждой.\n\n' + HELP)
+      await send(chat, '✅ This bot is yours now.\n\nAdd your inboxes: send /connect, sign in to one inbox, ' +
+        'and repeat for each of them.\n\n' + HELP)
     }
     return
   }
@@ -513,7 +565,9 @@ async function onUpdate(cfg: Config, u: any): Promise<void> {
   if (cfg.awaiting_filter && m.reply_to_message) await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
   if (text.startsWith('/')) await onCommand(cfg, chat, text)
   else if (m.reply_to_message) await onReply(chat, m, text)
-  else if (!(await applyAwaitedFilter(cfg, chat, text))) await send(chat, 'Чтобы ответить на письмо, нажми «Ответить» на нём. Все команды: /help')
+  else if (!(await applyAwaitedFilter(cfg, chat, text))) {
+    await send(chat, 'To answer an email, use Telegram\'s Reply on it. /help lists the commands.')
+  }
 }
 
 async function onCommand(cfg: Config, chat: string, text: string): Promise<void> {
@@ -537,30 +591,27 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await sendDigest(cfg, chat, false)
     case '/check': {
       if (cfg.paused === 'true') {
-        await send(chat, '⏸ Уведомления выключены. Сначала /resume.')
+        await send(chat, '⏸ Paused. /resume first.')
         return
       }
-      if (!(await pollAll(cfg))) await send(chat, '📭 Новых писем нет.')
+      if (!(await pollAll(cfg))) await send(chat, '📭 Nothing new.', TRASH)
       return
     }
     case '/mute':
       return await cmdMute(chat, arg, true)
     case '/unmute':
       return await cmdMute(chat, arg, false)
-    case '/muted': {
-      const muted = await loadMuted()
-      await send(chat, muted.length ? '🔇 Заглушены:\n' + esc(muted.join('\n')) : 'Никто не заглушён.')
-      return
-    }
+    case '/muted':
+      return await cmdMuted(chat)
     case '/pause':
       await setConfig('paused', 'true')
-      await send(chat, '⏸ Уведомления выключены. /resume включит их снова.')
+      await send(chat, '⏸ Paused. /resume turns emails back on.')
       return
     case '/resume':
       await setConfig('paused', 'false')
       // Fresh cursors: what arrived while paused is skipped, not dumped into the chat at once.
       await db.from('mailbot_inboxes').update({ history_id: null }).eq('status', 'connected')
-      await send(chat, '▶️ Уведомления включены. Что пришло за паузу, покажет /unread.')
+      await send(chat, '▶️ Back on. /unread shows what came in while paused.')
       return
     case '/status':
       return await cmdStatus(cfg, chat)
@@ -571,41 +622,41 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
 
 async function cmdConnect(chat: string, hint: string): Promise<void> {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-    await send(chat, 'Вход через Google не настроен на сервере (нет GOOGLE_CLIENT_ID).')
+    await send(chat, 'Google sign-in isn\'t set up on the server (GOOGLE_CLIENT_ID is missing).')
     return
   }
   const state = randomToken(18)
   await db.from('mailbot_oauth_states').insert({ state, code_verifier: randomToken(48), login_hint: hint || null })
   await db.from('mailbot_oauth_states').delete().lt('expires_at', new Date().toISOString())
   const link = `${FN_URL}/connect?s=${state}`
-  await send(chat, '🔐 Нажми кнопку, войди в почту, которую хочешь добавить, и разреши доступ.\n\n' +
-    'Если Google не открывается внутри Telegram, скопируй эту ссылку в Safari или Chrome:\n' + esc(link) +
-    '\n\nСсылка работает один раз, 15 минут.', {
-    inline_keyboard: [[{ text: '🔐 Войти через Google', url: link }]],
+  await send(chat, '🔐 Tap the button, sign in to the inbox you want to add, and allow access.\n\n' +
+    'If Google won\'t open inside Telegram, copy this link into Safari or Chrome:\n' + esc(link) +
+    '\n\nThe link works once, for 15 minutes.', {
+    inline_keyboard: [[{ text: '🔐 Sign in with Google', url: link }]],
   })
 }
 
 async function cmdInboxes(chat: string): Promise<void> {
   const { data } = await db.from('mailbot_inboxes').select('email, status, last_error, keywords').order('id')
   if (!data?.length) {
-    await send(chat, 'Почт пока нет. Отправь /connect, чтобы добавить.')
+    await send(chat, 'No inboxes yet. Send /connect to add one.')
     return
   }
   const lines = data.map((r) =>
     (r.status !== 'connected'
-      ? '⚠️ ' + esc(r.email) + ': вышла из аккаунта, подключи снова через /connect'
+      ? '⚠️ ' + esc(r.email) + ': signed out, /connect it again'
       : (r.last_error ? '⚠️ ' : '✅ ') + esc(r.email) + (r.last_error ? ': ' + esc(clip(r.last_error, 120)) : '')) +
     ' · 🏷 ' + esc(describeFilter(r as Inbox))
   )
-  lines.push('', '/connect добавит ещё одну. /disconnect name@company.com отключит.')
-  await send(chat, lines.join('\n'))
+  lines.push('', '/connect adds another. /disconnect name@company.com removes one.')
+  await send(chat, lines.join('\n'), TRASH)
 }
 
 async function cmdDisconnect(chat: string, arg: string): Promise<void> {
   const email = arg.toLowerCase()
   const { data: ib } = await db.from('mailbot_inboxes').select('id').eq('email', email).maybeSingle()
   if (!ib) {
-    await send(chat, 'Напиши так: /disconnect name@company.com (список: /inboxes)')
+    await send(chat, 'Usage: /disconnect name@company.com (see /inboxes)')
     return
   }
   // Best effort: revoke at Google too. Local data is removed either way.
@@ -622,13 +673,13 @@ async function cmdDisconnect(chat: string, arg: string): Promise<void> {
     console.error('revoke', e)
   }
   await db.rpc('mailbot_delete_inbox', { p_inbox_id: ib.id })
-  await send(chat, '🗑 ' + esc(email) + ' отключена.')
+  await send(chat, '🗑 Disconnected ' + esc(email) + '.')
 }
 
 async function cmdUnread(cfg: Config, chat: string): Promise<void> {
   const inboxes = await connectedInboxes()
   if (!inboxes.length) {
-    await send(chat, 'Почты ещё не подключены. Отправь /connect.')
+    await send(chat, 'No inboxes connected yet. Send /connect.')
     return
   }
   const muted = await loadMuted()
@@ -642,7 +693,7 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
         gmail(ib, `messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`)
       ))
       return msgs.map((m) => ({ ib, email: readEmail(m) }))
-        .filter((x) => !isMuted(muted, x.email.from.email) && matchRules(x.email, ib.keywords).pass)
+        .filter((x) => !isMuted(muted, x.email.from.email, x.email.subject) && matchRules(x.email, ib.keywords).pass)
     } catch (e) {
       console.error('unread', ib.email, e)
       return []
@@ -650,32 +701,54 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
   }))
   const items = lists.flat().sort((a, b) => b.email.date.getTime() - a.email.date.getTime()).slice(0, 10)
   if (!items.length) {
-    await send(chat, '📭 Непрочитанных писем нет.')
+    await send(chat, '📭 No unread emails.', TRASH)
     return
   }
   const tz = cfg.time_zone || DEFAULT_TIME_ZONE
-  const lines = ['📬 <b>Непрочитанные</b> (примерно ' + total + '). Сначала новые. Нажми номер, чтобы открыть письмо здесь.', '']
+  const lines = ['📬 <b>Unread</b> (about ' + total + '). Newest first, tap a number to open one here.', '']
   const buttons: Button[] = []
   items.forEach(({ ib, email }, i) => {
     lines.push((i + 1) + '. <a href="' + esc(gmailLink(ib.email, email.id)) + '">' +
-      esc(clip(email.subject || '(без темы)', 80)) + '</a>')
-    lines.push('     ' + esc(email.from.label) + ' · ' + esc(ib.label || ib.email) + ' · ' + fmtDate(email.date, tz))
+      esc(clip(email.subject || '(no subject)', 80)) + '</a>')
+    lines.push('     ' + esc(email.from.label) + ' → ' + esc(ib.label || ib.email) + ' · ' + fmtDate(email.date, tz))
     buttons.push({ text: String(i + 1), callback_data: `o:${ib.id}:${email.id}` })
   })
   const rows: Button[][] = []
   for (let i = 0; i < buttons.length; i += 5) rows.push(buttons.slice(i, i + 5))
+  rows.push([{ text: '🗑', callback_data: 'X' }])
   await send(chat, lines.join('\n'), { inline_keyboard: rows })
 }
 
 async function cmdMute(chat: string, arg: string, on: boolean): Promise<void> {
   const entry = arg.toLowerCase().replace(/^@/, '')
   if (!/^([^\s@]+@)?[^\s@]+\.[^\s@]+$/.test(entry)) {
-    await send(chat, 'Напиши так: /' + (on ? 'mute' : 'unmute') + ' name@company.com или company.com')
+    await send(chat, 'Usage: /' + (on ? 'mute' : 'unmute') + ' name@company.com or company.com')
     return
   }
   if (on) await db.from('mailbot_muted').upsert({ entry })
   else await db.from('mailbot_muted').delete().eq('entry', entry)
-  await send(chat, (on ? '🔇 Заглушён: ' : '🔔 Снова показываю: ') + esc(entry))
+  await send(chat, (on ? '🔕 Stopped: ' : '🔔 Back on: ') + esc(describeMute(entry)), TRASH)
+}
+
+/** /muted: everything stopped with 🔕, one tap to undo each. */
+async function mutedList(): Promise<{ text: string; markup: { inline_keyboard: Button[][] } }> {
+  const { data } = await db.from('mailbot_muted').select('id, entry').order('created_at')
+  const rows = data ?? []
+  if (!rows.length) return { text: 'Nothing is stopped. Use 🔕 on an email to stop emails like it.', markup: TRASH }
+  return {
+    text: '🔕 <b>Stopped</b>. Tap one to get those emails again.',
+    markup: {
+      inline_keyboard: [
+        ...rows.map((r) => [{ text: '↩ ' + clip(describeMute(r.entry), 55), callback_data: 'q:' + r.id }]),
+        [{ text: '🗑', callback_data: 'X' }],
+      ],
+    },
+  }
+}
+
+async function cmdMuted(chat: string): Promise<void> {
+  const list = await mutedList()
+  await send(chat, list.text, list.markup)
 }
 
 async function cmdStatus(cfg: Config, chat: string): Promise<void> {
@@ -686,100 +759,120 @@ async function cmdStatus(cfg: Config, chat: string): Promise<void> {
   const signedOut = rows.length - connected.length
   const last = connected.map((r) => Date.parse(r.last_checked_at ?? '') || 0).sort()[0]
   await send(chat, [
-    cfg.paused === 'true' ? '⏸ На паузе' : '✅ Работает, проверяю каждую минуту',
-    'Почты: подключено ' + connected.length + (failing ? ', с ошибкой ' + failing : '') +
-      (signedOut ? ', вышли из аккаунта ' + signedOut : ''),
-    'Самая давняя проверка: ' + (last ? Math.round((Date.now() - last) / 60_000) + ' мин назад' : 'ещё не было'),
-    'Заглушено: ' + (await loadMuted()).length,
-  ].join('\n'))
+    cfg.paused === 'true' ? '⏸ Paused' : '✅ Running, checking every minute',
+    'Inboxes: ' + connected.length + ' connected' + (failing ? ', ' + failing + ' failing' : '') +
+      (signedOut ? ', ' + signedOut + ' signed out' : ''),
+    'Oldest check: ' + (last ? Math.round((Date.now() - last) / 60_000) + ' min ago' : 'not yet'),
+    'Stopped with 🔕: ' + (await loadMuted()).length,
+  ].join('\n'), TRASH)
 }
+
+// -------------------------------------------------------------- callbacks --
 
 // deno-lint-ignore no-explicit-any
 async function onCallback(cfg: Config, q: any): Promise<void> {
   const chat = String(q.message.chat.id)
-  const [act, a, b] = String(q.data ?? '').split(':')
+  const messageId: number = q.message.message_id
+  const [act, a, b, c] = String(q.data ?? '').split(':')
   let toast = ''
   try {
-    if (act === 'e' || act === 'x') {
+    if (act === 'X') {
+      await remove(chat, messageId)
+    } else if (act === 'e' || act === 'z') {
       toast = await onFilterButton(q, act, a)
-    } else if (b && 'rafmo'.includes(act)) {
-      const ib = await inboxById(Number(a))
-      switch (act) {
-        case 'r':
-          await gmail(ib, `messages/${b}/modify`, { removeLabelIds: ['UNREAD'] })
-          await refreshKeyboard(q, ib, b, false)
-          toast = 'Отмечено как прочитанное'
-          break
-        case 'a': {
-          const m = await gmail(ib, `messages/${b}?format=minimal`)
-          await gmail(ib, `threads/${m.threadId}/modify`, { removeLabelIds: ['INBOX', 'UNREAD'] })
-          await refreshKeyboard(q, ib, b, true)
-          toast = 'В архиве'
-          break
-        }
-        case 'f':
-          await sendFullText(chat, ib, b, q.message.message_id)
-          break
-        case 'm': {
-          const sender = readEmail(await gmail(ib, `messages/${b}?format=metadata&metadataHeaders=From`)).from.email
-          await db.from('mailbot_muted').upsert({ entry: sender })
-          await send(chat, '🔇 Заглушён: ' + esc(sender) + '. Отменить: /unmute ' + esc(sender))
-          toast = 'Заглушён'
-          break
-        }
-        case 'o': {
-          const email = readEmail(await gmail(ib, `messages/${b}?format=full`))
-          await postEmail(ib, email, chat, cfg.time_zone || DEFAULT_TIME_ZONE,
-            matchRules(email, ib.keywords).tags)
-          break
-        }
-      }
+    } else if (act === 'q') {
+      const { data: gone } = await db.from('mailbot_muted').delete().eq('id', Number(a)).select('entry').maybeSingle()
+      if (gone) toast = 'Back on: ' + describeMute(gone.entry)
+      const list = await mutedList()
+      await edit(chat, messageId, list.text, list.markup)
     } else if (act === 'y' || act === 'Y') {
-      toast = await sendPendingReply(chat, a, act === 'Y', q.message.message_id)
+      toast = await sendPendingReply(q, a, act === 'Y')
     } else if (act === 'n') {
       await db.from('mailbot_pending_replies').delete().eq('key', a)
-      await tg('editMessageText', { chat_id: chat, message_id: q.message.message_id, text: '✖ Ответ отменён.' })
+      await clearReplyMessages(q)
+      toast = 'Cancelled'
+    } else if (b) {
+      toast = await onEmailButton(cfg, q, act, await inboxById(Number(a)), b, c)
     }
   } catch (e) {
     console.error('callback', q.data, e)
-    toast = 'Ошибка: ' + errorText(e)
+    toast = 'Failed: ' + errorText(e)
   }
   await tg('answerCallbackQuery', { callback_query_id: q.id, text: toast.slice(0, 190) })
 }
 
+/** Buttons on an email card. Old cards from before the redesign still send r, m and o. */
 // deno-lint-ignore no-explicit-any
-async function refreshKeyboard(q: any, ib: Inbox, id: string, archived: boolean): Promise<void> {
-  const rows: Button[][] = q.message.reply_markup?.inline_keyboard ?? []
-  const wasArchived = !rows.some((row) => row.some((btn) => btn.callback_data === `a:${ib.id}:${id}`))
-  await tg('editMessageReplyMarkup', {
-    chat_id: q.message.chat.id,
-    message_id: q.message.message_id,
-    reply_markup: emailKeyboard(ib.id, id, gmailLink(ib.email, id), false, archived || wasArchived),
-  })
-}
-
-async function sendFullText(chat: string, ib: Inbox, id: string, replyTo: number): Promise<void> {
-  const text = readableBody(readEmail(await gmail(ib, `messages/${id}?format=full`)), false) || '(пустое письмо)'
-  const size = 3800
-  for (let i = 0; i < text.length && i < size * 4; i += size) {
-    await send(chat, esc(text.slice(i, i + size)), undefined, replyTo)
+async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: string, kind?: string): Promise<string> {
+  const chat = String(q.message.chat.id)
+  const messageId: number = q.message.message_id
+  switch (act) {
+    case 'v':
+      await showCard(q, ib, id, 'more', cfg)
+      return ''
+    case 'c':
+      await showCard(q, ib, id, 'min', cfg)
+      return ''
+    case 'f':
+      await showCard(q, ib, id, 'full', cfg)
+      return ''
+    case 'p':
+      await sendFiles(chat, ib, id, messageId)
+      return ''
+    case 'r':
+      await gmail(ib, `messages/${id}/modify`, { removeLabelIds: ['UNREAD'] })
+      return 'Marked as read'
+    case 'd':
+      await gmail(ib, `messages/${id}/modify`, { removeLabelIds: ['UNREAD'] })
+      await remove(chat, messageId)
+      return 'Removed from chat. Still in Gmail, marked read.'
+    case 'a': {
+      const m = await gmail(ib, `messages/${id}?format=minimal`)
+      await gmail(ib, `threads/${m.threadId}/modify`, { removeLabelIds: ['INBOX', 'UNREAD'] })
+      await remove(chat, messageId)
+      return 'Archived in Gmail'
+    }
+    case 's': {
+      const email = readEmail(await gmail(ib, `messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`))
+      await tg('editMessageReplyMarkup', { chat_id: chat, message_id: messageId, reply_markup: stopKeyboard(ib.id, email) })
+      return ''
+    }
+    case 'M':
+    case 'm': {
+      const email = readEmail(await gmail(ib, `messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`))
+      const entry = muteEntry(email, kind ?? 's')
+      if (!entry) return ''
+      await db.from('mailbot_muted').upsert({ entry })
+      const undo = { text: '↩ Undo', callback_data: `U:${ib.id}:${id}:${kind ?? 's'}` }
+      await edit(chat, messageId, '🔕 Stopped: ' + esc(describeMute(entry)),
+        { inline_keyboard: [[undo, { text: '🗑', callback_data: 'X' }]] })
+      return 'Stopped'
+    }
+    case 'U': {
+      const email = await fetchEmail(ib, id)
+      const entry = muteEntry(email, kind ?? 's')
+      if (entry) await db.from('mailbot_muted').delete().eq('entry', entry)
+      await edit(chat, messageId, cardFor(ib, email, cfg.time_zone || DEFAULT_TIME_ZONE, 'min'), cardButtons(ib, email, 'min'))
+      return 'Back on'
+    }
+    case 'o':
+      await postCard(ib, await fetchEmail(ib, id), chat, cfg.time_zone || DEFAULT_TIME_ZONE, 'more')
+      return ''
   }
-  if (text.length > size * 4) {
-    await send(chat, '…остальное в <a href="' + esc(gmailLink(ib.email, id)) + '">Gmail</a>.', undefined, replyTo)
-  }
+  return ''
 }
 
 // ---------------------------------------------------------------- filters --
 
 function describeFilter(ib: Inbox): string {
-  return ib.keywords?.length ? ib.keywords.join(', ') : 'все письма'
+  return ib.keywords?.length ? ib.keywords.join(', ') : 'all mail'
 }
 
-/** A rule as the user should read it: "payment (и похожие: pay, paid, invoice…) + insurance (…)". */
+/** A rule as the user should read it: "payment (and similar: pay, paid, invoice…) + insurance (…)". */
 function describeRule(rule: string): string {
   return rule.split(' + ').map((w) => {
     const similar = similarWords(w)
-    return similar.length ? w + ' (и похожие: ' + similar.slice(0, 5).join(', ') + '…)' : w
+    return similar.length ? w + ' (and similar: ' + similar.slice(0, 5).join(', ') + '…)' : w
   }).join(' + ')
 }
 
@@ -790,26 +883,26 @@ async function filterTargets(target: string): Promise<Inbox[]> {
   return target === 'all' ? inboxes : inboxes.filter((ib) => String(ib.id) === target)
 }
 
-/** Replaces the target inboxes' rules with what the user typed; "все" / "off" removes the filter. */
+/** Replaces the target inboxes' rules with what the user typed; "all" / "off" removes the filter. */
 async function applyFilter(chat: string, target: string, input: string): Promise<void> {
   const inboxes = await filterTargets(target)
   if (!inboxes.length) {
-    await send(chat, 'Эта почта больше не подключена. Список: /inboxes')
+    await send(chat, 'That inbox is no longer connected. See /inboxes')
     return
   }
-  const rules = /^\s*(off|all|все|выкл|нет)\s*$/i.test(input) ? [] : parseRules(input)
+  const rules = /^\s*(off|all|none|все|выкл|нет)\s*$/i.test(input) ? [] : parseRules(input)
   await db.from('mailbot_inboxes').update({ keywords: rules }).in('id', inboxes.map((ib) => ib.id))
-  const who = target === 'all' ? 'всех почт' : inboxes[0].email
+  const who = target === 'all' ? 'all inboxes' : inboxes[0].email
   if (!rules.length) {
-    await send(chat, '✅ С ' + esc(who) + ' теперь приходят все письма.')
+    await send(chat, '✅ ' + esc(who) + ': you get all emails now.', TRASH)
     return
   }
   await send(chat, [
-    '✅ С <b>' + esc(who) + '</b> теперь приходят только письма, где есть:',
+    '✅ <b>' + esc(who) + '</b>: you only get emails that have',
     ...rules.map((r) => '• ' + esc(describeRule(r))),
     '',
-    'Остальные не пропадут: раз в день пришлю список отсеянного. Посмотреть сейчас: /skipped',
-  ].join('\n'))
+    'The rest isn\'t lost: you get a list of them every day. To see it now: /skipped',
+  ].join('\n'), TRASH)
 }
 
 /** After "✏️" the next plain message is the word list; this applies it. */
@@ -825,28 +918,28 @@ async function applyAwaitedFilter(cfg: Config, chat: string, text: string): Prom
 async function askFilterWords(chat: string, target: string): Promise<void> {
   const inboxes = await filterTargets(target)
   if (!inboxes.length) {
-    await send(chat, 'Эта почта больше не подключена. Список: /inboxes')
+    await send(chat, 'That inbox is no longer connected. See /inboxes')
     return
   }
   await setConfig('awaiting_filter', target + '|' + Date.now())
-  const who = target === 'all' ? 'всех почт сразу' : inboxes[0].email
+  const who = target === 'all' ? 'all inboxes' : inboxes[0].email
   await send(chat, [
-    '✏️ Напиши слова для <b>' + esc(who) + '</b> одним сообщением.',
-    ...(target === 'all' ? [] : ['Сейчас: ' + esc(describeFilter(inboxes[0]))]),
+    '✏️ Type the words for <b>' + esc(who) + '</b> in one message.',
+    ...(target === 'all' ? [] : ['Now: ' + esc(describeFilter(inboxes[0]))]),
     '',
-    'Письмо придёт, если в нём есть хотя бы одно правило.',
-    'Через запятую, если хватит любого: <code>payment, erbol</code>',
-    'С плюсом, если нужны оба слова: <code>payment + insurance</code>',
-    'Похожие слова считаются сами: payment найдёт и invoice, и «оплата».',
+    'An email comes through if it matches at least one rule.',
+    'Commas, if any word is enough: <code>payment, erbol</code>',
+    'Plus, if both words must be there: <code>payment + insurance</code>',
+    'Similar words count too: payment also finds invoice and «оплата».',
     '',
-    'Новый список заменит старый.',
-  ].join('\n'), { inline_keyboard: [[{ text: '🌐 Все письма (без фильтра)', callback_data: 'x:' + target }]] })
+    'The new list replaces the old one.',
+  ].join('\n'), { inline_keyboard: [[{ text: '🌐 All emails (no filter)', callback_data: 'z:' + target }]] })
 }
 
 async function cmdFilter(chat: string, arg: string): Promise<void> {
   const inboxes = await filterTargets('all')
   if (!inboxes.length) {
-    await send(chat, 'Сначала подключи почту: /connect')
+    await send(chat, 'Connect an inbox first: /connect')
     return
   }
   if (arg) {
@@ -855,16 +948,16 @@ async function cmdFilter(chat: string, arg: string): Promise<void> {
       ? 'all'
       : String(inboxes.find((ib) => ib.email === first.toLowerCase())?.id ?? '')
     if (!target) {
-      await send(chat, 'Напиши так: /filter name@gmail.com payment, erbol\nИли просто /filter и выбери почту.')
+      await send(chat, 'Usage: /filter name@gmail.com payment, erbol\nOr just /filter and pick an inbox.')
       return
     }
     const words = rest.join(' ').trim()
     return words ? await applyFilter(chat, target, words) : await askFilterWords(chat, target)
   }
-  const lines = ['🏷 <b>Фильтры</b>', '', ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
-    'Нажми на почту и напиши слова. Письма без этих слов в Telegram не придут.']
+  const lines = ['🏷 <b>Filters</b>', '', ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
+    'Tap an inbox and type the words. Emails without them won\'t come to Telegram.']
   const rows: Button[][] = inboxes.map((ib) => [{ text: '✏️ ' + ib.email, callback_data: 'e:' + ib.id }])
-  if (inboxes.length > 1) rows.push([{ text: '✏️ Все почты сразу', callback_data: 'e:all' }])
+  if (inboxes.length > 1) rows.push([{ text: '✏️ All inboxes at once', callback_data: 'e:all' }])
   await send(chat, lines.join('\n'), { inline_keyboard: rows })
 }
 
@@ -876,8 +969,8 @@ async function onFilterButton(q: any, act: string, target: string): Promise<stri
     return ''
   }
   await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
-  await applyFilter(chat, target, 'все')
-  return 'Фильтр убран'
+  await applyFilter(chat, target, 'all')
+  return 'Filter removed'
 }
 
 /**
@@ -889,7 +982,7 @@ async function sendDigest(cfg: Config, chat: string, scheduled: boolean): Promis
     .order('received_at', { ascending: false }).limit(500)
   const rows = data ?? []
   if (!rows.length) {
-    if (!scheduled) await send(chat, '📭 Фильтры ничего не отсеяли.')
+    if (!scheduled) await send(chat, '📭 Your filters held nothing back.', TRASH)
     return
   }
   const { data: inboxes } = await db.from('mailbot_inboxes').select('id, email')
@@ -897,16 +990,16 @@ async function sendDigest(cfg: Config, chat: string, scheduled: boolean): Promis
   const tz = cfg.time_zone || DEFAULT_TIME_ZONE
   const shown = rows.slice(0, DIGEST_ITEMS)
   const lines = [
-    '📋 <b>Фильтры отсеяли ' + rows.length + '</b>' + (rows.length > shown.length ? ' (здесь последние ' + shown.length + ')' : ''),
-    'Глянь, нет ли важного. Если есть, добавь слово через /filter.',
+    '📋 <b>Filters held back ' + rows.length + '</b>' + (rows.length > shown.length ? ' (latest ' + shown.length + ' here)' : ''),
+    'Anything important? Add a word with /filter.',
     '',
   ]
   for (const r of shown) {
     const inbox = emailOf.get(r.inbox_id) ?? ''
-    lines.push('• <a href="' + esc(gmailLink(inbox, r.message_id)) + '">' + esc(clip(r.subject || '(без темы)', 60)) + '</a>')
-    lines.push('   ' + esc(clip(r.sender, 30)) + ' · ' + esc(inbox) + ' · ' + fmtDate(new Date(r.received_at), tz))
+    lines.push('• <a href="' + esc(gmailLink(inbox, r.message_id)) + '">' + esc(clip(r.subject || '(no subject)', 60)) + '</a>')
+    lines.push('   ' + esc(clip(r.sender, 30)) + ' → ' + esc(inbox) + ' · ' + fmtDate(new Date(r.received_at), tz))
   }
-  const res = await send(chat, lines.join('\n'))
+  const res = await send(chat, lines.join('\n'), TRASH)
   if (res.ok) {
     for (const r of shown) {
       await db.from('mailbot_skipped').delete().eq('inbox_id', r.inbox_id).eq('message_id', r.message_id)
@@ -920,16 +1013,16 @@ async function sendDigest(cfg: Config, chat: string, scheduled: boolean): Promis
 async function onReply(chat: string, m: any, text: string): Promise<void> {
   const ref = refFromEntities(m.reply_to_message.entities) ?? refFromEntities(m.reply_to_message.caption_entities)
   if (!ref) {
-    await send(chat, 'Чтобы ответить, нажми «Ответить» на сообщении с одним письмом.')
+    await send(chat, 'Reply to one email\'s message to answer it.')
     return
   }
   if (!text) {
-    await send(chat, 'Пока можно отвечать только текстом.')
+    await send(chat, 'Only text replies work for now.')
     return
   }
   const { data: ib } = await db.from('mailbot_inboxes').select('*').eq('email', ref.inbox).maybeSingle()
   if (!ib) {
-    await send(chat, esc(ref.inbox) + ' больше не подключена. Сначала /connect.')
+    await send(chat, esc(ref.inbox) + ' isn\'t connected anymore. /connect it first.')
     return
   }
   const email = readEmail(await gmail(ib as Inbox, `messages/${ref.id}?format=metadata&${REPLY_HEADERS}`))
@@ -939,30 +1032,34 @@ async function onReply(chat: string, m: any, text: string): Promise<void> {
   await db.from('mailbot_pending_replies').insert({ key, inbox_id: ib.id, message_id: ref.id, body: text })
   await db.from('mailbot_pending_replies').delete().lt('created_at', new Date(Date.now() - 86_400_000).toISOString())
 
-  const lines = ['↩️ <b>Кому:</b> ' + esc(one.to.join(', ')), '<b>От:</b> ' + esc(ib.email)]
-  if (all.cc.length) lines.push('<b>«Ответить всем» добавит:</b> ' + esc(all.cc.join(', ')))
+  const lines = ['↩️ <b>To:</b> ' + esc(one.to.join(', ')), '<b>From:</b> ' + esc(ib.email)]
+  if (all.cc.length) lines.push('<b>Reply all also goes to:</b> ' + esc(all.cc.join(', ')))
   lines.push('', esc(text))
-  const buttons: Button[] = [{ text: '✅ Отправить', callback_data: 'y:' + key }]
-  if (all.cc.length) buttons.push({ text: '👥 Ответить всем', callback_data: 'Y:' + key })
-  buttons.push({ text: '✖ Отмена', callback_data: 'n:' + key })
+  const buttons: Button[] = [{ text: '✅ Send', callback_data: 'y:' + key }]
+  if (all.cc.length) buttons.push({ text: '👥 Reply all', callback_data: 'Y:' + key })
+  buttons.push({ text: '✖ Cancel', callback_data: 'n:' + key })
   await send(chat, lines.join('\n'), { inline_keyboard: [buttons] }, m.message_id)
 }
 
-async function sendPendingReply(chat: string, key: string, all: boolean, confirmId: number): Promise<string> {
+/** After Send or Cancel, the typed reply and the confirmation leave the chat. */
+// deno-lint-ignore no-explicit-any
+async function clearReplyMessages(q: any): Promise<void> {
+  const typed = q.message.reply_to_message?.message_id
+  await remove(q.message.chat.id, q.message.message_id)
+  if (typed) await tg('deleteMessage', { chat_id: q.message.chat.id, message_id: typed })
+}
+
+// deno-lint-ignore no-explicit-any
+async function sendPendingReply(q: any, key: string, all: boolean): Promise<string> {
   // Deleting is the claim: a double tap or a Telegram retry finds nothing the second time.
   const { data: p } = await db.from('mailbot_pending_replies').delete().eq('key', key).select().maybeSingle()
-  if (!p) return 'Уже отправлено или отменено'
+  if (!p) return 'Already sent or cancelled'
   const ib = await inboxById(p.inbox_id)
   const email = readEmail(await gmail(ib, `messages/${p.message_id}?format=metadata&${REPLY_HEADERS}`))
   const reply = buildReply(email, ib.email, p.body, all)
   await gmail(ib, 'messages/send', { raw: reply.raw, threadId: email.threadId })
-  await tg('editMessageText', {
-    chat_id: chat,
-    message_id: confirmId,
-    text: '✅ Отправлено: ' + esc([...reply.to, ...reply.cc].join(', ')) + '\n\n' + esc(p.body),
-    parse_mode: 'HTML',
-  })
-  return 'Отправлено'
+  await clearReplyMessages(q)
+  return 'Sent to ' + [...reply.to, ...reply.cc].join(', ')
 }
 
 // ----------------------------------------------------------------- routes --
@@ -983,7 +1080,7 @@ async function handleConnect(req: Request): Promise<Response> {
   const { data: hs } = await db.from('mailbot_oauth_states').select('code_verifier, login_hint, expires_at')
     .eq('state', state).maybeSingle()
   if (!hs || Date.parse(hs.expires_at) < Date.now()) {
-    return page('Эта ссылка для входа устарела или уже использована. Отправь /connect в Telegram, чтобы получить новую.', 400)
+    return page('This sign-in link has expired or was already used. Send /connect in Telegram for a new one.', 400)
   }
   const url = new URL(AUTH_ENDPOINT)
   url.searchParams.set('client_id', GOOGLE_CLIENT_ID)
@@ -1003,17 +1100,17 @@ async function handleConnect(req: Request): Promise<Response> {
 async function handleCallback(req: Request): Promise<Response> {
   const params = new URL(req.url).searchParams
   if (params.get('error')) {
-    return page('Google ответил: ' + params.get('error') + '. Отправь /connect в Telegram и попробуй ещё раз.', 400)
+    return page('Google said: ' + params.get('error') + '. Send /connect in Telegram to try again.', 400)
   }
   const code = params.get('code')
   const state = params.get('state')
-  if (!code || !state) return page('Не хватает данных для входа. Отправь /connect в Telegram и попробуй ещё раз.', 400)
+  if (!code || !state) return page('Missing sign-in details. Send /connect in Telegram to try again.', 400)
 
   // Single use: deleted on read, so a replayed callback can't connect anything.
   const { data: hs } = await db.from('mailbot_oauth_states').delete().eq('state', state)
     .select('code_verifier, expires_at').maybeSingle()
   if (!hs || Date.parse(hs.expires_at) < Date.now()) {
-    return page('Эта ссылка для входа устарела или уже использована. Отправь /connect в Telegram, чтобы получить новую.', 400)
+    return page('This sign-in link has expired or was already used. Send /connect in Telegram for a new one.', 400)
   }
 
   const t = await postToken({
@@ -1024,17 +1121,17 @@ async function handleCallback(req: Request): Promise<Response> {
     grant_type: 'authorization_code',
     redirect_uri: REDIRECT_URI,
   })
-  if (!t.access_token) return page('Google отказал во входе: ' + (t.error_description ?? t.error) + '.', 400)
+  if (!t.access_token) return page('Google refused the sign-in: ' + (t.error_description ?? t.error) + '.', 400)
   if (!String(t.scope ?? '').includes(GMAIL_SCOPE)) {
-    return page('Доступ к Gmail не выдан. Отправь /connect ещё раз и поставь галочку Gmail на экране разрешений Google.', 400)
+    return page('Gmail access wasn\'t granted. Send /connect again and tick the Gmail box on Google\'s permission screen.', 400)
   }
   if (!t.refresh_token) {
-    return page('Google не выдал постоянный доступ. Отправь /connect ещё раз.', 400)
+    return page('Google didn\'t hand out a lasting token. Send /connect again.', 400)
   }
 
   const profileRes = await fetch(GMAIL + 'profile', { headers: { Authorization: 'Bearer ' + t.access_token } })
   if (!profileRes.ok) {
-    return page('Вход выполнен, но Gmail не дал доступ (' + profileRes.status + '). Включён ли Gmail API в Google Cloud?', 502)
+    return page('Signed in, but Gmail refused access (' + profileRes.status + '). Is the Gmail API enabled in Google Cloud?', 502)
   }
   const profile = await profileRes.json()
   const email = String(profile.emailAddress ?? idTokenEmail(t.id_token)).toLowerCase()
@@ -1048,17 +1145,17 @@ async function handleCallback(req: Request): Promise<Response> {
     history_id: String(profile.historyId),
     connected_at: new Date().toISOString(),
   }, { onConflict: 'email' }).select('id').single()
-  if (error || !row) return page('Не получилось сохранить почту: ' + (error?.message ?? 'unknown') + '.', 500)
+  if (error || !row) return page('Couldn\'t save the inbox: ' + (error?.message ?? 'unknown') + '.', 500)
   const { error: vaultError } = await db.rpc('mailbot_store_refresh_token', { p_inbox_id: row.id, p_token: t.refresh_token })
-  if (vaultError) return page('Не получилось сохранить доступ: ' + vaultError.message + '.', 500)
+  if (vaultError) return page('Couldn\'t store the token: ' + vaultError.message + '.', 500)
 
   const cfg = await loadConfig()
   if (cfg.owner_chat_id) {
-    await send(cfg.owner_chat_id, '✅ <b>' + esc(email) + '</b> подключена. Новые письма из неё будут приходить сюда.\n\n' +
-      '/connect добавит ещё одну почту.')
+    await send(cfg.owner_chat_id, '✅ <b>' + esc(email) + '</b> is connected. New mail from it will show up here.\n\n' +
+      '/connect adds another inbox.', TRASH)
   }
   if (cfg.bot_username) return Response.redirect('https://t.me/' + cfg.bot_username, 302)
-  return page('✅ ' + email + ' подключена. Можно вернуться в Telegram.')
+  return page('✅ ' + email + ' is connected. You can go back to Telegram.')
 }
 
 async function handleCron(req: Request): Promise<Response> {
