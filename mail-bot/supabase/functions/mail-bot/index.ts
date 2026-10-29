@@ -12,10 +12,13 @@ import {
   fmtDate,
   gmailLink,
   isMuted,
+  matchFilter,
   readableBody,
   readEmail,
   refFromEntities,
   shouldSkip,
+  topicFor,
+  TOPICS,
   type Attachment,
   type Button,
 } from './mail.ts'
@@ -68,6 +71,7 @@ const HELP = [
   '/inboxes: подключённые почты',
   '/disconnect name@company.com: отключить почту',
   '/unread: последние непрочитанные письма',
+  '/filter: какие письма присылать с каждой почты (темы: страховка, оплата, аудит…)',
   '/check: проверить все почты прямо сейчас',
   '/mute name@company.com или company.com: не показывать письма от человека или компании',
   '/unmute, /muted: вернуть или посмотреть заглушённых',
@@ -90,6 +94,8 @@ interface Inbox {
   history_id: string | null
   status: string
   last_error: string | null
+  topics: string[]
+  keywords: string[]
 }
 
 // ---------------------------------------------------------------- helpers --
@@ -416,11 +422,13 @@ async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz:
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
   if (isMuted(muted, email.from.email)) return false
-  await postEmail(ib, email, chat, tz)
+  const filter = matchFilter(email, ib.topics, ib.keywords)
+  if (!filter.pass) return false
+  await postEmail(ib, email, chat, tz, filter.tags)
   return true
 }
 
-async function postEmail(ib: Inbox, email: Email, chat: string, tz: string): Promise<void> {
+async function postEmail(ib: Inbox, email: Email, chat: string, tz: string, tags: string[] = []): Promise<void> {
   const link = gmailLink(ib.email, email.id)
   const text = cardText({
     inbox: ib.label || ib.email,
@@ -428,6 +436,7 @@ async function postEmail(ib: Inbox, email: Email, chat: string, tz: string): Pro
     link,
     preview: clip(readableBody(email, true), PREVIEW_CHARS),
     timeZone: tz,
+    tags,
   })
   const res = await send(chat, text, emailKeyboard(ib.id, email.id, link, email.labelIds.includes('UNREAD'), false))
   if (!res.ok) throw new TelegramError(res)
@@ -506,6 +515,8 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdDisconnect(chat, arg)
     case '/unread':
       return await cmdUnread(cfg, chat)
+    case '/filter':
+      return await cmdFilter(chat, arg)
     case '/check': {
       if (cfg.paused === 'true') {
         await send(chat, '⏸ Уведомления выключены. Сначала /resume.')
@@ -557,15 +568,16 @@ async function cmdConnect(chat: string, hint: string): Promise<void> {
 }
 
 async function cmdInboxes(chat: string): Promise<void> {
-  const { data } = await db.from('mailbot_inboxes').select('email, status, last_error').order('id')
+  const { data } = await db.from('mailbot_inboxes').select('email, status, last_error, topics, keywords').order('id')
   if (!data?.length) {
     await send(chat, 'Почт пока нет. Отправь /connect, чтобы добавить.')
     return
   }
   const lines = data.map((r) =>
-    r.status !== 'connected'
+    (r.status !== 'connected'
       ? '⚠️ ' + esc(r.email) + ': вышла из аккаунта, подключи снова через /connect'
-      : (r.last_error ? '⚠️ ' : '✅ ') + esc(r.email) + (r.last_error ? ': ' + esc(clip(r.last_error, 120)) : '')
+      : (r.last_error ? '⚠️ ' : '✅ ') + esc(r.email) + (r.last_error ? ': ' + esc(clip(r.last_error, 120)) : '')) +
+    ' · 🏷 ' + esc(describeFilter(r as Inbox))
   )
   lines.push('', '/connect добавит ещё одну. /disconnect name@company.com отключит.')
   await send(chat, lines.join('\n'))
@@ -611,7 +623,8 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
       const msgs = await Promise.all((list.messages ?? []).map((m: any) =>
         gmail(ib, `messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`)
       ))
-      return msgs.map((m) => ({ ib, email: readEmail(m) })).filter((x) => !isMuted(muted, x.email.from.email))
+      return msgs.map((m) => ({ ib, email: readEmail(m) }))
+        .filter((x) => !isMuted(muted, x.email.from.email) && matchFilter(x.email, ib.topics, ib.keywords).pass)
     } catch (e) {
       console.error('unread', ib.email, e)
       return []
@@ -669,7 +682,9 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
   const [act, a, b] = String(q.data ?? '').split(':')
   let toast = ''
   try {
-    if (b && 'rafmo'.includes(act)) {
+    if (act === 'e' || act === 't' || act === 'x') {
+      toast = await onFilterButton(q, act, Number(a), b)
+    } else if (b && 'rafmo'.includes(act)) {
       const ib = await inboxById(Number(a))
       switch (act) {
         case 'r':
@@ -694,10 +709,12 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
           toast = 'Заглушён'
           break
         }
-        case 'o':
-          await postEmail(ib, readEmail(await gmail(ib, `messages/${b}?format=full`)), chat,
-            cfg.time_zone || DEFAULT_TIME_ZONE)
+        case 'o': {
+          const email = readEmail(await gmail(ib, `messages/${b}?format=full`))
+          await postEmail(ib, email, chat, cfg.time_zone || DEFAULT_TIME_ZONE,
+            matchFilter(email, ib.topics, ib.keywords).tags)
           break
+        }
       }
     } else if (act === 'y' || act === 'Y') {
       toast = await sendPendingReply(chat, a, act === 'Y', q.message.message_id)
@@ -732,6 +749,93 @@ async function sendFullText(chat: string, ib: Inbox, id: string, replyTo: number
   if (text.length > size * 4) {
     await send(chat, '…остальное в <a href="' + esc(gmailLink(ib.email, id)) + '">Gmail</a>.', undefined, replyTo)
   }
+}
+
+// ---------------------------------------------------------------- filters --
+
+function describeFilter(ib: Inbox): string {
+  const parts = [...(ib.topics ?? []).map((t) => TOPICS[t]?.label ?? t), ...(ib.keywords ?? []).map((k) => '«' + k + '»')]
+  return parts.length ? parts.join(', ') : 'все письма'
+}
+
+/** The per-inbox filter screen: one toggle per topic, plus "all mail". */
+function filterEditor(ib: Inbox): { text: string; markup: { inline_keyboard: Button[][] } } {
+  const lines = ['🏷 <b>' + esc(ib.email) + '</b>', '']
+  if (!ib.topics.length && !ib.keywords.length) {
+    lines.push('Сейчас приходят все письма. Отметь темы, и будут приходить только письма о них.')
+  } else {
+    lines.push('Приходят только письма на эти темы: ' + esc(describeFilter(ib)) + '.')
+  }
+  lines.push('', 'Свои слова: /filter ' + esc(ib.email) + ' слово1, слово2')
+  const toggles: Button[] = Object.entries(TOPICS).map(([key, t]) => ({
+    text: (ib.topics.includes(key) ? '✅ ' : '⬜ ') + t.label,
+    callback_data: `t:${ib.id}:${key}`,
+  }))
+  const rows: Button[][] = []
+  for (let i = 0; i < toggles.length; i += 2) rows.push(toggles.slice(i, i + 2))
+  rows.push([{ text: '🌐 Все письма (без фильтра)', callback_data: 'x:' + ib.id }])
+  return { text: lines.join('\n'), markup: { inline_keyboard: rows } }
+}
+
+async function cmdFilter(chat: string, arg: string): Promise<void> {
+  const { data } = await db.from('mailbot_inboxes').select('*').order('id')
+  const inboxes = (data ?? []) as Inbox[]
+  if (!inboxes.length) {
+    await send(chat, 'Сначала подключи почту: /connect')
+    return
+  }
+  if (!arg) {
+    const lines = ['🏷 <b>Фильтры</b>', '', ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
+      'Нажми на почту, чтобы выбрать темы.']
+    await send(chat, lines.join('\n'), {
+      inline_keyboard: inboxes.map((ib) => [{ text: '✏️ ' + ib.email, callback_data: 'e:' + ib.id }]),
+    })
+    return
+  }
+  const [address, ...rest] = arg.split(/\s+/)
+  const ib = inboxes.find((x) => x.email === address.toLowerCase())
+  if (!ib) {
+    await send(chat, 'Такой подключённой почты нет. Список: /inboxes')
+    return
+  }
+  const words = rest.join(' ').split(/[,;]+/).map((w) => w.trim()).filter(Boolean)
+  if (words.length) {
+    const off = words.length === 1 && /^(off|all|все|выкл)$/i.test(words[0])
+    ib.topics = off ? [] : [...new Set([...ib.topics, ...words.map(topicFor).filter((t): t is string => Boolean(t))])]
+    ib.keywords = off ? [] : [...new Set([...ib.keywords, ...words.filter((w) => !topicFor(w)).map((w) => w.toLowerCase())])]
+    await db.from('mailbot_inboxes').update({ topics: ib.topics, keywords: ib.keywords }).eq('id', ib.id)
+  }
+  const editor = filterEditor(ib)
+  await send(chat, editor.text, editor.markup)
+}
+
+// deno-lint-ignore no-explicit-any
+async function onFilterButton(q: any, act: string, inboxId: number, topic: string | undefined): Promise<string> {
+  const ib = await inboxById(inboxId)
+  let toast = ''
+  if (act === 't' && topic && TOPICS[topic]) {
+    ib.topics = ib.topics.includes(topic) ? ib.topics.filter((t) => t !== topic) : [...ib.topics, topic]
+    await db.from('mailbot_inboxes').update({ topics: ib.topics }).eq('id', ib.id)
+    toast = (ib.topics.includes(topic) ? 'Добавлено: ' : 'Убрано: ') + TOPICS[topic].label
+  } else if (act === 'x') {
+    ib.topics = []
+    ib.keywords = []
+    await db.from('mailbot_inboxes').update({ topics: [], keywords: [] }).eq('id', ib.id)
+    toast = 'Теперь приходят все письма'
+  }
+  const editor = filterEditor(ib)
+  if (act === 'e') {
+    await send(String(q.message.chat.id), editor.text, editor.markup)
+  } else {
+    await tg('editMessageText', {
+      chat_id: q.message.chat.id,
+      message_id: q.message.message_id,
+      text: editor.text,
+      parse_mode: 'HTML',
+      reply_markup: editor.markup,
+    })
+  }
+  return toast
 }
 
 // ---------------------------------------------------------------- replies --

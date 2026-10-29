@@ -8,12 +8,15 @@ import {
   emailKeyboard,
   type GmailMessage,
   isMuted,
+  matchFilter,
   parseAddress,
   parseAddressList,
   readableBody,
   readEmail,
   refFromEntities,
   shouldSkip,
+  topicFor,
+  wordMatch,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -197,4 +200,57 @@ Deno.test('reply threads correctly; reply-all drops yourself and duplicates', ()
   assert.ok(ru.includes('To: billing@aladdincap.com\r\n'), ru)
   const subject = ru.match(/Subject: =\?UTF-8\?B\?([^?]+)\?=/)![1]
   assert.equal(new TextDecoder().decode(base64urlToBytes(subject)), 'Re: Счёт за октябрь')
+})
+
+Deno.test('words: prefixes, whole words, Russian and ё', () => {
+  assert.ok(wordMatch('Your insurance renewal', 'insurance*'))
+  assert.ok(wordMatch('Продление страхования', 'страхов*'))
+  assert.ok(wordMatch('Счёт №45 за октябрь', 'счет'))
+  assert.ok(wordMatch('ACH transfer sent', 'ach'))
+  assert.ok(!wordMatch('Achieve more this week', 'ach'))
+  assert.ok(!wordMatch('Счетчик воды', 'счет'))
+  assert.ok(wordMatch('Your wire  transfer is done', 'wire transfer*'))
+  assert.ok(!wordMatch('anything', '*'))
+})
+
+Deno.test('filters let through only the chosen topics and say why', () => {
+  const e = readEmail(message())
+  const set = (subject: string, text = '', from = 'Someone <x@y.com>') => {
+    e.subject = subject
+    e.text = text
+    e.snippet = ''
+    e.from = parseAddress(from)
+    return e
+  }
+  assert.deepEqual(matchFilter(set('Lunch tomorrow?'), [], []), { pass: true, tags: [] })
+  assert.deepEqual(matchFilter(set('Invoice #4411 for October'), ['payment', 'audit'], []), { pass: true, tags: ['Оплата'] })
+  assert.deepEqual(matchFilter(set('Settlement Report -- for AAJ COM'), ['payment'], []).tags, ['Оплата'])
+  assert.deepEqual(matchFilter(set('COI needed for new load'), ['insurance'], []).tags, ['Страховка'])
+  assert.deepEqual(matchFilter(set('IFTA audit next week'), ['audit'], []).tags, ['Аудит'])
+  assert.deepEqual(matchFilter(set('Оплата по договору', 'Добрый день'), ['payment', 'contracts'], []).tags, ['Оплата', 'Договоры'])
+  assert.equal(matchFilter(set('Lunch tomorrow?'), ['payment', 'insurance'], []).pass, false)
+  // Lookalikes that must not pass.
+  assert.equal(matchFilter(set('Claim your $100 off'), ['insurance'], []).pass, false)
+  assert.equal(matchFilter(set('Quick question', 'Hi', 'Bill Lambert <blambert@aladdincap.com>'), ['payment'], []).pass, false)
+  assert.equal(matchFilter(set('News', 'Hello there. ' + 'x '.repeat(400) + 'Read our privacy policy and invoice terms'), ['payment', 'insurance'], []).pass, false)
+  // Custom words match by word start; the snippet stands in when there is no body.
+  e.text = ''
+  e.subject = 'Weekly update'
+  e.snippet = 'The truck DOT number 1355817 &amp; MC'
+  assert.deepEqual(matchFilter(e, [], ['1355817']), { pass: true, tags: ['«1355817»'] })
+  assert.deepEqual(matchFilter(set('Go USA Trucking update'), [], ['go usa']).tags, ['«go usa»'])
+})
+
+Deno.test('topic names can be typed in English or Russian', () => {
+  assert.equal(topicFor('Оплата'), 'payment')
+  assert.equal(topicFor('insurance'), 'insurance')
+  assert.equal(topicFor(' аудит '), 'audit')
+  assert.equal(topicFor('налоги'), 'taxes')
+  assert.equal(topicFor('lunch'), null)
+})
+
+Deno.test('the card shows why a filtered email came through', () => {
+  const e = readEmail(message())
+  const t = cardText({ inbox: 'info@jolgo.app', email: e, link: 'x', preview: '', timeZone: 'Asia/Bishkek', tags: ['Оплата'] })
+  assert.ok(t.startsWith('📥 <b>info@jolgo.app</b> · 🏷 Оплата\n'), t)
 })

@@ -23,6 +23,7 @@ export interface GmailMessage {
   threadId: string
   labelIds?: string[]
   internalDate?: string
+  snippet?: string
   payload?: GmailPart
 }
 
@@ -46,6 +47,7 @@ export interface Email {
   date: Date
   messageId: string
   references: string
+  snippet: string
   text: string
   attachments: Attachment[]
 }
@@ -165,6 +167,7 @@ export function readEmail(msg: GmailMessage): Email {
     date,
     messageId: header(root, 'Message-ID') || header(root, 'Message-Id'),
     references: header(root, 'References'),
+    snippet: decodeEntities(msg.snippet ?? ''),
     text: plain ? decodeText(plain) : html ? htmlToText(decodeText(html)) : '',
     attachments,
   }
@@ -232,6 +235,85 @@ export function decodeEntities(s: string): string {
     .replace(/&amp;/g, '&')
 }
 
+// --------------------------------------------------------------- filters --
+
+/**
+ * Topics an inbox can be limited to. A word ending in * matches any word that
+ * starts with it (страхов* → страховка, страхование); other words match only
+ * as whole words, so "ach" never matches "achieve" and "bill" isn't in the list
+ * at all because it is also a name.
+ */
+export const TOPICS: Record<string, { label: string; names: string[]; words: string[] }> = {
+  insurance: {
+    label: 'Страховка',
+    names: ['insurance', 'страховка', 'страхование'],
+    words: ['insurance*', 'insurer*', 'insured', 'coi', 'certificate of insurance', 'policy number', 'policy renewal',
+      'premium*', 'coverage', 'underwrit*', 'endorsement*', 'insurance claim*', 'claim number', 'страхов*', 'полис*'],
+  },
+  payment: {
+    label: 'Оплата',
+    names: ['payment', 'payments', 'оплата', 'платежи', 'invoice', 'invoices'],
+    words: ['payment*', 'paid', 'invoice*', 'receipt*', 'remittance*', 'settlement*', 'ach', 'wire transfer*', 'payout*',
+      'refund*', 'billing', 'factoring', 'over advance', 'оплат*', 'платеж*', 'счет', 'счета', 'инвойс*', 'квитанц*'],
+  },
+  audit: {
+    label: 'Аудит',
+    names: ['audit', 'аудит', 'проверки'],
+    words: ['audit*', 'compliance', 'ifta', 'fmcsa', 'dot audit', 'dot inspection', 'inspection*', 'аудит*', 'проверк*',
+      'ревизи*'],
+  },
+  contracts: {
+    label: 'Договоры',
+    names: ['contracts', 'contract', 'договоры', 'договор'],
+    words: ['contract*', 'agreement*', 'docusign', 'hellosign', 'dropbox sign', 'signature request*', 'please sign', 'nda',
+      'договор*', 'соглашени*', 'подпис*'],
+  },
+  taxes: {
+    label: 'Налоги',
+    names: ['taxes', 'tax', 'налоги', 'налог'],
+    words: ['tax', 'taxes', 'irs', '1099*', 'w-9', 'w9', 'налог*', 'декларац*'],
+  },
+}
+
+/** Lower case, ё → е, so "Счёт" and "счет" are the same word. */
+function fold(s: string): string {
+  return s.toLowerCase().replace(/ё/g, 'е')
+}
+
+export function wordMatch(text: string, word: string): boolean {
+  const prefix = word.endsWith('*')
+  const w = fold(prefix ? word.slice(0, -1) : word).trim()
+  if (!w) return false
+  const body = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
+  return new RegExp('(?<![\\p{L}\\p{N}])' + body + (prefix ? '' : '(?![\\p{L}\\p{N}])'), 'u').test(fold(text))
+}
+
+/** The topic a word the user typed names ("оплата", "payment"), if any. */
+export function topicFor(word: string): string | null {
+  const w = fold(word.trim())
+  return Object.keys(TOPICS).find((key) => TOPICS[key].names.includes(w)) ?? null
+}
+
+/**
+ * Whether an email passes an inbox's filter, and the labels that let it through.
+ * No topics and no keywords means no filter. Only the start of the body is
+ * read: footers ("privacy policy", "unsubscribe") would match almost anything.
+ */
+export function matchFilter(email: Email, topics: string[], keywords: string[]): { pass: boolean; tags: string[] } {
+  if (!topics.length && !keywords.length) return { pass: true, tags: [] }
+  const text = [email.subject, email.from.name, email.from.email,
+    email.text ? readableBody(email, true).slice(0, 600) : email.snippet].join('\n')
+  const tags: string[] = []
+  for (const key of topics) {
+    const topic = TOPICS[key]
+    if (topic && topic.words.some((w) => wordMatch(text, w))) tags.push(topic.label)
+  }
+  for (const k of keywords) {
+    if (wordMatch(text, k.endsWith('*') ? k : k + '*')) tags.push('«' + k + '»')
+  }
+  return { pass: tags.length > 0, tags }
+}
+
 // -------------------------------------------------------------- telegram --
 
 export function esc(s: string): string {
@@ -267,10 +349,12 @@ export function refFromEntities(entities: { type: string; url?: string }[] | und
   return refs.size === 1 ? [...refs.values()][0] : null
 }
 
-export function cardText(o: { inbox: string; email: Email; link: string; preview: string; timeZone: string }): string {
+export function cardText(
+  o: { inbox: string; email: Email; link: string; preview: string; timeZone: string; tags?: string[] },
+): string {
   const { email } = o
   const lines = [
-    '📥 <b>' + esc(o.inbox) + '</b>',
+    '📥 <b>' + esc(o.inbox) + '</b>' + (o.tags?.length ? ' · 🏷 ' + esc(o.tags.join(', ')) : ''),
     '👤 <b>' + esc(email.from.label) + '</b>' + (email.from.name ? ' ' + esc('<' + email.from.email + '>') : ''),
     // The reply flow reads the inbox and Gmail ID back from this link.
     '✉️ <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(без темы)', 300)) + '</a>',
