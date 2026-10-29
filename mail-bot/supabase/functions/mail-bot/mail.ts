@@ -237,21 +237,66 @@ export function decodeEntities(s: string): string {
 
 // --------------------------------------------------------------- filters --
 
+/**
+ * Words that mean the same thing for filtering, in English and Russian. A rule
+ * word from a family matches the whole family, so "payment" also finds
+ * "invoice" and "оплата". A member ending in * matches any word starting with
+ * it; the rest match only as whole words, so "ach" never matches "achieve" and
+ * "tax" never matches "taxi". Phrases stand in for words too common alone:
+ * "privacy policy" is in every footer and "claim" in every ad.
+ */
+export const FAMILIES: string[][] = [
+  ['payment*', 'pay', 'paid', 'invoice*', 'receipt*', 'remittance*', 'settlement*', 'ach', 'wire transfer*', 'payout*',
+    'refund*', 'billing', 'balance due', 'amount due', 'оплат*', 'платеж*', 'счет', 'счета', 'инвойс*', 'квитанц*'],
+  ['insur*', 'coi', 'certificate of insurance', 'policy number', 'policy renewal', 'premium*', 'coverage',
+    'underwrit*', 'endorsement*', 'claim number', 'страхов*', 'полис*'],
+  ['audit*', 'compliance', 'ifta', 'fmcsa', 'inspection*', 'аудит*', 'проверк*', 'ревизи*'],
+  ['contract*', 'agreement*', 'docusign', 'hellosign', 'dropbox sign', 'signature request*', 'please sign', 'nda',
+    'договор*', 'соглашени*', 'подпис*'],
+  ['tax', 'taxes', 'taxation', 'irs', '1099*', 'w-9', 'w9', 'налог*', 'декларац*'],
+]
+
 /** Lower case, ё → е, so "Счёт" and "счет" are the same word. */
 function fold(s: string): string {
   return s.toLowerCase().replace(/ё/g, 'е')
 }
 
+/** The family a rule word belongs to ("payment", "оплата", "insurance"), if any. */
+export function familyOf(word: string): string[] | null {
+  const w = fold(word.replace(/\*$/, '').trim())
+  return FAMILIES.find((family) =>
+    family.some((m) => (m.endsWith('*') ? w.startsWith(fold(m.slice(0, -1))) : w === fold(m)))
+  ) ?? null
+}
+
+/** The other words a rule word also matches, for showing the user. */
+export function similarWords(word: string): string[] {
+  const w = fold(word.trim())
+  return (familyOf(word) ?? []).map((m) => m.replace(/\*$/, '')).filter((m) => fold(m) !== w)
+}
+
 /**
- * Whether `word` appears in `text` at the start of a word. A trailing * is
- * allowed and means the same. Spaces inside `word` match any run of spaces,
- * so "late payment" finds "late  payment".
+ * The text in `text` that `word` matches, or ''. A trailing * means "any word
+ * starting with this"; without it only the whole word counts. Spaces inside
+ * `word` match any run of spaces, so "late payment" finds "late  payment".
  */
-export function wordMatch(text: string, word: string): boolean {
-  const w = fold(word.replace(/\*$/, '')).trim()
-  if (!w) return false
+export function findWord(text: string, word: string): string {
+  const prefix = word.endsWith('*')
+  const w = fold(prefix ? word.slice(0, -1) : word).trim()
+  if (!w) return ''
   const body = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
-  return new RegExp('(?<![\\p{L}\\p{N}])' + body, 'u').test(fold(text))
+  const re = new RegExp('(?<![\\p{L}\\p{N}])' + body + (prefix ? '[\\p{L}\\p{N}]*' : '(?![\\p{L}\\p{N}])'), 'u')
+  return re.exec(fold(text))?.[0] ?? ''
+}
+
+/** A rule word found in `text`: its family if it has one, otherwise any word starting with it. */
+function findRuleWord(text: string, word: string): string {
+  const family = familyOf(word)
+  for (const w of family ?? [word.endsWith('*') ? word : word + '*']) {
+    const hit = findWord(text, w)
+    if (hit) return hit
+  }
+  return ''
 }
 
 /**
@@ -268,7 +313,8 @@ export function parseRules(input: string): string[] {
 }
 
 /**
- * Whether an email passes an inbox's rules, and which rules let it through.
+ * Whether an email passes an inbox's rules, and the words that let it through
+ * (as found in the email, e.g. "invoice + premium" for "payment + insurance").
  * No rules means everything passes. The whole email is searched: subject,
  * sender, full text and attachment names; without a body (list views) the
  * snippet stands in.
@@ -277,7 +323,11 @@ export function matchRules(email: Email, rules: string[]): { pass: boolean; tags
   if (!rules.length) return { pass: true, tags: [] }
   const text = [email.subject, email.from.name, email.from.email,
     email.text ? readableBody(email, false) : email.snippet, ...email.attachments.map((a) => a.name)].join('\n')
-  const tags = rules.filter((rule) => rule.split(' + ').every((w) => wordMatch(text, w)))
+  const tags: string[] = []
+  for (const rule of rules) {
+    const found = rule.split(' + ').map((w) => findRuleWord(text, w))
+    if (found.every(Boolean)) tags.push(found.join(' + '))
+  }
   return { pass: tags.length > 0, tags }
 }
 

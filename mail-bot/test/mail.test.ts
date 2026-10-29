@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import {
   base64urlToBytes,
+  findWord,
   buildReply,
   bytesToBase64url,
   cardText,
@@ -16,7 +17,7 @@ import {
   refFromEntities,
   parseRules,
   shouldSkip,
-  wordMatch,
+  similarWords,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -202,48 +203,74 @@ Deno.test('reply threads correctly; reply-all drops yourself and duplicates', ()
   assert.equal(new TextDecoder().decode(base64urlToBytes(subject)), 'Re: Счёт за октябрь')
 })
 
-Deno.test('words match at the start of a word, in any case, ё = е', () => {
-  assert.ok(wordMatch('Hi Erbol, see attached', 'erbol'))
-  assert.ok(wordMatch('Payments are due', 'payment'))
-  assert.ok(wordMatch('Продление страхования', 'страхов'))
-  assert.ok(wordMatch('Счёт №45 за октябрь', 'счет'))
-  assert.ok(wordMatch('Late  payment notice', 'late payment'))
-  assert.ok(!wordMatch('Please display this', 'pay'))
-  assert.ok(!wordMatch('anything', '  '))
+Deno.test('words: start of a word, any case, ё = е, whole words when asked', () => {
+  assert.equal(findWord('Hi Erbol, see attached', 'erbol*'), 'erbol')
+  assert.equal(findWord('Payments are due', 'payment*'), 'payments')
+  assert.equal(findWord('Продление страхования', 'страхов*'), 'страхования')
+  assert.equal(findWord('Счёт №45 за октябрь', 'счет'), 'счет')
+  assert.equal(findWord('Late  payment notice', 'late payment*'), 'late  payment')
+  assert.equal(findWord('Please display this', 'pay*'), '')
+  assert.equal(findWord('Achieve more', 'ach'), '')
+  assert.equal(findWord('anything', '  '), '')
 })
 
-Deno.test('rules: commas mean any word, + means all words', () => {
+Deno.test('rules: commas mean any rule, + means all words', () => {
   assert.deepEqual(parseRules('Payment, Erbol; insurance + payment ,  late   payment\nerbol'),
     ['payment', 'erbol', 'insurance + payment', 'late payment'])
   assert.deepEqual(parseRules(' , ; '), [])
 })
 
-Deno.test('an email passes if any rule matches anywhere in it', () => {
-  const e = readEmail(message())
-  const set = (subject: string, text: string, files: string[] = []) => {
+Deno.test('similar words come with the family', () => {
+  assert.ok(similarWords('payment').includes('invoice'))
+  assert.ok(similarWords('оплата').includes('payment'))
+  assert.ok(similarWords('insurance').includes('страхов'))
+  assert.deepEqual(similarWords('erbol'), [])
+})
+
+// The owner's real case: "payment + insurance, erbol" on a trucking inbox.
+const RULES = ['payment + insurance', 'erbol']
+const cases: [string, string, string, string[], string | null][] = [
+  // [subject, body, sender, attachments, expected tag or null = held back]
+  ['Premium invoice for policy #4411', 'Please see attached.', 'billing@progressive.com', [], 'invoice + premium'],
+  ['Insurance payment received', 'Thanks!', 'ar@aladdincap.com', [], 'payment + insurance'],
+  ['Оплата страховки за октябрь', 'Счёт во вложении', 'buh@company.kg', [], 'оплата + страховки'],
+  ['COI and invoice', 'Attached for load 4411', 'broker@loads.com', [], 'invoice + coi'],
+  ['Docs', 'see attached', 'jerry@grtplains.com', ['Insurance_Invoice_4411.pdf'], 'invoice + insurance'],
+  ['Can you call me?', 'Hi Erbol, quick question about the load.', 'heatherg@aladdincap.com', [], 'erbol'],
+  ['Lunch tomorrow?', 'Are you free at 1?', 'friend@gmail.com', [], null],
+  ['Your receipt from Anthropic', 'Receipt #2117. Read our privacy policy.', 'invoice@mail.anthropic.com', [], null],
+  ['Claim your $100 off', 'Cloudflare Connect is almost sold out.', 'em@em1.cloudflare.com', [], null],
+  ['Insurance renewal reminder', 'Your policy renews on Nov 1.', 'agent@insure.com', [], null],
+]
+
+for (const [subject, body, sender, files, expected] of cases) {
+  Deno.test(`"${subject}" ${expected ? 'comes through as ' + expected : 'is held back'}`, () => {
+    const e = readEmail(message())
     e.subject = subject
-    e.text = text
-    e.snippet = ''
+    e.text = body
+    e.from = parseAddress(sender)
     e.attachments = files.map((name) => ({ name, mimeType: 'application/pdf', size: 1 }))
-    return e
-  }
-  assert.deepEqual(matchRules(set('Lunch?', 'hi'), []), { pass: true, tags: [] })
-  assert.deepEqual(matchRules(set('Payment for insurance', ''), ['erbol', 'insurance + payment']),
-    { pass: true, tags: ['insurance + payment'] })
-  assert.equal(matchRules(set('Payment received', ''), ['insurance + payment']).pass, false)
-  assert.deepEqual(matchRules(set('Docs', 'Hi Erbol, see attached'), ['erbol']).tags, ['erbol'])
-  // The whole body counts, not just the start, and quoted history too.
-  assert.ok(matchRules(set('Update', 'x '.repeat(3000) + 'payment due Friday'), ['payment']).pass)
-  assert.ok(matchRules(set('Re: load', 'ok\n\nOn Mon, Oct 26, 2026 at 10:00 AM Jerry wrote:\n> payment sent'), ['payment']).pass)
-  // Attachment names count.
-  assert.ok(matchRules(set('Docs', 'see attached', ['Invoice_4411.pdf']), ['invoice']).pass)
-  assert.equal(matchRules(set('Weekly news', 'nothing here'), ['payment', 'erbol']).pass, false)
-  // List views have no body: the snippet stands in.
-  e.text = ''
-  e.subject = 'Weekly update'
-  e.snippet = 'Erbol, the truck MC 1355817 is ready'
+    const r = matchRules(e, RULES)
+    assert.equal(r.pass, expected !== null, JSON.stringify(r))
+    if (expected) assert.ok(r.tags.includes(expected), JSON.stringify(r))
+  })
+}
+
+Deno.test('the whole email counts; no rules means everything; snippet stands in for lists', () => {
+  const e = readEmail(message())
+  e.subject = 'Update'
   e.attachments = []
+  e.text = 'x '.repeat(3000) + 'Erbol, payment due Friday'
+  assert.ok(matchRules(e, ['erbol']).pass)
+  e.text = 'ok\n\nOn Mon, Oct 26, 2026 at 10:00 AM Jerry wrote:\n> erbol said hi'
+  assert.ok(matchRules(e, ['erbol']).pass)
+  assert.deepEqual(matchRules(e, []), { pass: true, tags: [] })
+  assert.equal(matchRules(e, ['tax']).pass, false)
+  e.text = ''
+  e.snippet = 'Erbol, the truck MC 1355817 is ready'
   assert.deepEqual(matchRules(e, ['1355817', 'erbol']).tags, ['1355817', 'erbol'])
+  e.snippet = 'Taxi receipt for Tuesday'
+  assert.equal(matchRules(e, ['tax']).pass, false)
 })
 
 Deno.test('the card shows why a filtered email came through', () => {

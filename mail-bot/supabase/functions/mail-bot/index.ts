@@ -12,13 +12,13 @@ import {
   fmtDate,
   gmailLink,
   isMuted,
-  matchFilter,
+  matchRules,
+  parseRules,
   readableBody,
   readEmail,
   refFromEntities,
   shouldSkip,
-  topicFor,
-  TOPICS,
+  similarWords,
   type Attachment,
   type Button,
 } from './mail.ts'
@@ -64,6 +64,8 @@ const MAX_ATTACHMENTS = 10
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 const EXPIRY_MARGIN_MS = 60_000
 const DEFAULT_TIME_ZONE = 'Asia/Bishkek'
+const FILTER_WAIT_MS = 10 * 60_000
+const DIGEST_ITEMS = 20
 
 const HELP = [
   '<b>Команды</b>',
@@ -71,7 +73,8 @@ const HELP = [
   '/inboxes: подключённые почты',
   '/disconnect name@company.com: отключить почту',
   '/unread: последние непрочитанные письма',
-  '/filter: какие письма присылать с каждой почты (темы: страховка, оплата, аудит…)',
+  '/filter: присылать только письма с нужными словами (payment, erbol, payment + insurance)',
+  '/skipped: письма, которые фильтры не пропустили',
   '/check: проверить все почты прямо сейчас',
   '/mute name@company.com или company.com: не показывать письма от человека или компании',
   '/unmute, /muted: вернуть или посмотреть заглушённых',
@@ -94,7 +97,6 @@ interface Inbox {
   history_id: string | null
   status: string
   last_error: string | null
-  topics: string[]
   keywords: string[]
 }
 
@@ -339,6 +341,7 @@ async function pollAll(cfg: Config): Promise<number> {
   }))
   if (Math.random() < 1 / 60) {
     await db.from('mailbot_seen').delete().lt('seen_at', new Date(Date.now() - 14 * 86_400_000).toISOString())
+    await db.from('mailbot_skipped').delete().lt('received_at', new Date(Date.now() - 7 * 86_400_000).toISOString())
   }
   return counts.reduce((a, b) => a + b, 0)
 }
@@ -422,8 +425,18 @@ async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz:
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
   if (isMuted(muted, email.from.email)) return false
-  const filter = matchFilter(email, ib.topics, ib.keywords)
-  if (!filter.pass) return false
+  const filter = matchRules(email, ib.keywords)
+  if (!filter.pass) {
+    // Held back, not lost: the daily digest and /skipped list these.
+    await db.from('mailbot_skipped').upsert({
+      inbox_id: ib.id,
+      message_id: email.id,
+      sender: email.from.label,
+      subject: email.subject,
+      received_at: email.date.toISOString(),
+    })
+    return false
+  }
   await postEmail(ib, email, chat, tz, filter.tags)
   return true
 }
@@ -497,15 +510,18 @@ async function onUpdate(cfg: Config, u: any): Promise<void> {
   }
   if (chat !== owner) return
 
+  if (cfg.awaiting_filter && m.reply_to_message) await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
   if (text.startsWith('/')) await onCommand(cfg, chat, text)
   else if (m.reply_to_message) await onReply(chat, m, text)
-  else await send(chat, 'Чтобы ответить на письмо, нажми «Ответить» на нём. Все команды: /help')
+  else if (!(await applyAwaitedFilter(cfg, chat, text))) await send(chat, 'Чтобы ответить на письмо, нажми «Ответить» на нём. Все команды: /help')
 }
 
 async function onCommand(cfg: Config, chat: string, text: string): Promise<void> {
   const [first, ...rest] = text.split(/\s+/)
   const cmd = first.toLowerCase().replace(/@\w+$/, '')
   const arg = rest.join(' ').trim()
+  // Any command cancels a pending "type your words" from /filter.
+  if (cfg.awaiting_filter) await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
   switch (cmd) {
     case '/connect':
       return await cmdConnect(chat, arg)
@@ -517,6 +533,8 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdUnread(cfg, chat)
     case '/filter':
       return await cmdFilter(chat, arg)
+    case '/skipped':
+      return await sendDigest(cfg, chat, false)
     case '/check': {
       if (cfg.paused === 'true') {
         await send(chat, '⏸ Уведомления выключены. Сначала /resume.')
@@ -568,7 +586,7 @@ async function cmdConnect(chat: string, hint: string): Promise<void> {
 }
 
 async function cmdInboxes(chat: string): Promise<void> {
-  const { data } = await db.from('mailbot_inboxes').select('email, status, last_error, topics, keywords').order('id')
+  const { data } = await db.from('mailbot_inboxes').select('email, status, last_error, keywords').order('id')
   if (!data?.length) {
     await send(chat, 'Почт пока нет. Отправь /connect, чтобы добавить.')
     return
@@ -624,7 +642,7 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
         gmail(ib, `messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`)
       ))
       return msgs.map((m) => ({ ib, email: readEmail(m) }))
-        .filter((x) => !isMuted(muted, x.email.from.email) && matchFilter(x.email, ib.topics, ib.keywords).pass)
+        .filter((x) => !isMuted(muted, x.email.from.email) && matchRules(x.email, ib.keywords).pass)
     } catch (e) {
       console.error('unread', ib.email, e)
       return []
@@ -682,8 +700,8 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
   const [act, a, b] = String(q.data ?? '').split(':')
   let toast = ''
   try {
-    if (act === 'e' || act === 't' || act === 'x') {
-      toast = await onFilterButton(q, act, Number(a), b)
+    if (act === 'e' || act === 'x') {
+      toast = await onFilterButton(q, act, a)
     } else if (b && 'rafmo'.includes(act)) {
       const ib = await inboxById(Number(a))
       switch (act) {
@@ -712,7 +730,7 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
         case 'o': {
           const email = readEmail(await gmail(ib, `messages/${b}?format=full`))
           await postEmail(ib, email, chat, cfg.time_zone || DEFAULT_TIME_ZONE,
-            matchFilter(email, ib.topics, ib.keywords).tags)
+            matchRules(email, ib.keywords).tags)
           break
         }
       }
@@ -754,88 +772,146 @@ async function sendFullText(chat: string, ib: Inbox, id: string, replyTo: number
 // ---------------------------------------------------------------- filters --
 
 function describeFilter(ib: Inbox): string {
-  const parts = [...(ib.topics ?? []).map((t) => TOPICS[t]?.label ?? t), ...(ib.keywords ?? []).map((k) => '«' + k + '»')]
-  return parts.length ? parts.join(', ') : 'все письма'
+  return ib.keywords?.length ? ib.keywords.join(', ') : 'все письма'
 }
 
-/** The per-inbox filter screen: one toggle per topic, plus "all mail". */
-function filterEditor(ib: Inbox): { text: string; markup: { inline_keyboard: Button[][] } } {
-  const lines = ['🏷 <b>' + esc(ib.email) + '</b>', '']
-  if (!ib.topics.length && !ib.keywords.length) {
-    lines.push('Сейчас приходят все письма. Отметь темы, и будут приходить только письма о них.')
-  } else {
-    lines.push('Приходят только письма на эти темы: ' + esc(describeFilter(ib)) + '.')
+/** A rule as the user should read it: "payment (и похожие: pay, paid, invoice…) + insurance (…)". */
+function describeRule(rule: string): string {
+  return rule.split(' + ').map((w) => {
+    const similar = similarWords(w)
+    return similar.length ? w + ' (и похожие: ' + similar.slice(0, 5).join(', ') + '…)' : w
+  }).join(' + ')
+}
+
+/** The inboxes a filter target names: one inbox id, or "all". */
+async function filterTargets(target: string): Promise<Inbox[]> {
+  const { data } = await db.from('mailbot_inboxes').select('*').order('id')
+  const inboxes = (data ?? []) as Inbox[]
+  return target === 'all' ? inboxes : inboxes.filter((ib) => String(ib.id) === target)
+}
+
+/** Replaces the target inboxes' rules with what the user typed; "все" / "off" removes the filter. */
+async function applyFilter(chat: string, target: string, input: string): Promise<void> {
+  const inboxes = await filterTargets(target)
+  if (!inboxes.length) {
+    await send(chat, 'Эта почта больше не подключена. Список: /inboxes')
+    return
   }
-  lines.push('', 'Свои слова: /filter ' + esc(ib.email) + ' слово1, слово2')
-  const toggles: Button[] = Object.entries(TOPICS).map(([key, t]) => ({
-    text: (ib.topics.includes(key) ? '✅ ' : '⬜ ') + t.label,
-    callback_data: `t:${ib.id}:${key}`,
-  }))
-  const rows: Button[][] = []
-  for (let i = 0; i < toggles.length; i += 2) rows.push(toggles.slice(i, i + 2))
-  rows.push([{ text: '🌐 Все письма (без фильтра)', callback_data: 'x:' + ib.id }])
-  return { text: lines.join('\n'), markup: { inline_keyboard: rows } }
+  const rules = /^\s*(off|all|все|выкл|нет)\s*$/i.test(input) ? [] : parseRules(input)
+  await db.from('mailbot_inboxes').update({ keywords: rules }).in('id', inboxes.map((ib) => ib.id))
+  const who = target === 'all' ? 'всех почт' : inboxes[0].email
+  if (!rules.length) {
+    await send(chat, '✅ С ' + esc(who) + ' теперь приходят все письма.')
+    return
+  }
+  await send(chat, [
+    '✅ С <b>' + esc(who) + '</b> теперь приходят только письма, где есть:',
+    ...rules.map((r) => '• ' + esc(describeRule(r))),
+    '',
+    'Остальные не пропадут: раз в день пришлю список отсеянного. Посмотреть сейчас: /skipped',
+  ].join('\n'))
+}
+
+/** After "✏️" the next plain message is the word list; this applies it. */
+async function applyAwaitedFilter(cfg: Config, chat: string, text: string): Promise<boolean> {
+  const [target, at] = (cfg.awaiting_filter ?? '').split('|')
+  if (!target) return false
+  await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
+  if (Date.now() - Number(at) > FILTER_WAIT_MS) return false
+  await applyFilter(chat, target, text)
+  return true
+}
+
+async function askFilterWords(chat: string, target: string): Promise<void> {
+  const inboxes = await filterTargets(target)
+  if (!inboxes.length) {
+    await send(chat, 'Эта почта больше не подключена. Список: /inboxes')
+    return
+  }
+  await setConfig('awaiting_filter', target + '|' + Date.now())
+  const who = target === 'all' ? 'всех почт сразу' : inboxes[0].email
+  await send(chat, [
+    '✏️ Напиши слова для <b>' + esc(who) + '</b> одним сообщением.',
+    ...(target === 'all' ? [] : ['Сейчас: ' + esc(describeFilter(inboxes[0]))]),
+    '',
+    'Письмо придёт, если в нём есть хотя бы одно правило.',
+    'Через запятую, если хватит любого: <code>payment, erbol</code>',
+    'С плюсом, если нужны оба слова: <code>payment + insurance</code>',
+    'Похожие слова считаются сами: payment найдёт и invoice, и «оплата».',
+    '',
+    'Новый список заменит старый.',
+  ].join('\n'), { inline_keyboard: [[{ text: '🌐 Все письма (без фильтра)', callback_data: 'x:' + target }]] })
 }
 
 async function cmdFilter(chat: string, arg: string): Promise<void> {
-  const { data } = await db.from('mailbot_inboxes').select('*').order('id')
-  const inboxes = (data ?? []) as Inbox[]
+  const inboxes = await filterTargets('all')
   if (!inboxes.length) {
     await send(chat, 'Сначала подключи почту: /connect')
     return
   }
-  if (!arg) {
-    const lines = ['🏷 <b>Фильтры</b>', '', ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
-      'Нажми на почту, чтобы выбрать темы.']
-    await send(chat, lines.join('\n'), {
-      inline_keyboard: inboxes.map((ib) => [{ text: '✏️ ' + ib.email, callback_data: 'e:' + ib.id }]),
-    })
-    return
+  if (arg) {
+    const [first, ...rest] = arg.split(/\s+/)
+    const target = /^(all|все)$/i.test(first)
+      ? 'all'
+      : String(inboxes.find((ib) => ib.email === first.toLowerCase())?.id ?? '')
+    if (!target) {
+      await send(chat, 'Напиши так: /filter name@gmail.com payment, erbol\nИли просто /filter и выбери почту.')
+      return
+    }
+    const words = rest.join(' ').trim()
+    return words ? await applyFilter(chat, target, words) : await askFilterWords(chat, target)
   }
-  const [address, ...rest] = arg.split(/\s+/)
-  const ib = inboxes.find((x) => x.email === address.toLowerCase())
-  if (!ib) {
-    await send(chat, 'Такой подключённой почты нет. Список: /inboxes')
-    return
-  }
-  const words = rest.join(' ').split(/[,;]+/).map((w) => w.trim()).filter(Boolean)
-  if (words.length) {
-    const off = words.length === 1 && /^(off|all|все|выкл)$/i.test(words[0])
-    ib.topics = off ? [] : [...new Set([...ib.topics, ...words.map(topicFor).filter((t): t is string => Boolean(t))])]
-    ib.keywords = off ? [] : [...new Set([...ib.keywords, ...words.filter((w) => !topicFor(w)).map((w) => w.toLowerCase())])]
-    await db.from('mailbot_inboxes').update({ topics: ib.topics, keywords: ib.keywords }).eq('id', ib.id)
-  }
-  const editor = filterEditor(ib)
-  await send(chat, editor.text, editor.markup)
+  const lines = ['🏷 <b>Фильтры</b>', '', ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
+    'Нажми на почту и напиши слова. Письма без этих слов в Telegram не придут.']
+  const rows: Button[][] = inboxes.map((ib) => [{ text: '✏️ ' + ib.email, callback_data: 'e:' + ib.id }])
+  if (inboxes.length > 1) rows.push([{ text: '✏️ Все почты сразу', callback_data: 'e:all' }])
+  await send(chat, lines.join('\n'), { inline_keyboard: rows })
 }
 
 // deno-lint-ignore no-explicit-any
-async function onFilterButton(q: any, act: string, inboxId: number, topic: string | undefined): Promise<string> {
-  const ib = await inboxById(inboxId)
-  let toast = ''
-  if (act === 't' && topic && TOPICS[topic]) {
-    ib.topics = ib.topics.includes(topic) ? ib.topics.filter((t) => t !== topic) : [...ib.topics, topic]
-    await db.from('mailbot_inboxes').update({ topics: ib.topics }).eq('id', ib.id)
-    toast = (ib.topics.includes(topic) ? 'Добавлено: ' : 'Убрано: ') + TOPICS[topic].label
-  } else if (act === 'x') {
-    ib.topics = []
-    ib.keywords = []
-    await db.from('mailbot_inboxes').update({ topics: [], keywords: [] }).eq('id', ib.id)
-    toast = 'Теперь приходят все письма'
-  }
-  const editor = filterEditor(ib)
+async function onFilterButton(q: any, act: string, target: string): Promise<string> {
+  const chat = String(q.message.chat.id)
   if (act === 'e') {
-    await send(String(q.message.chat.id), editor.text, editor.markup)
-  } else {
-    await tg('editMessageText', {
-      chat_id: q.message.chat.id,
-      message_id: q.message.message_id,
-      text: editor.text,
-      parse_mode: 'HTML',
-      reply_markup: editor.markup,
-    })
+    await askFilterWords(chat, target)
+    return ''
   }
-  return toast
+  await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
+  await applyFilter(chat, target, 'все')
+  return 'Фильтр убран'
+}
+
+/**
+ * Emails the filters held back, newest first. Sent once a day and on /skipped,
+ * so a filter never makes an email disappear unseen.
+ */
+async function sendDigest(cfg: Config, chat: string, scheduled: boolean): Promise<void> {
+  const { data } = await db.from('mailbot_skipped').select('inbox_id, message_id, sender, subject, received_at')
+    .order('received_at', { ascending: false }).limit(500)
+  const rows = data ?? []
+  if (!rows.length) {
+    if (!scheduled) await send(chat, '📭 Фильтры ничего не отсеяли.')
+    return
+  }
+  const { data: inboxes } = await db.from('mailbot_inboxes').select('id, email')
+  const emailOf = new Map((inboxes ?? []).map((ib) => [ib.id, ib.email]))
+  const tz = cfg.time_zone || DEFAULT_TIME_ZONE
+  const shown = rows.slice(0, DIGEST_ITEMS)
+  const lines = [
+    '📋 <b>Фильтры отсеяли ' + rows.length + '</b>' + (rows.length > shown.length ? ' (здесь последние ' + shown.length + ')' : ''),
+    'Глянь, нет ли важного. Если есть, добавь слово через /filter.',
+    '',
+  ]
+  for (const r of shown) {
+    const inbox = emailOf.get(r.inbox_id) ?? ''
+    lines.push('• <a href="' + esc(gmailLink(inbox, r.message_id)) + '">' + esc(clip(r.subject || '(без темы)', 60)) + '</a>')
+    lines.push('   ' + esc(clip(r.sender, 30)) + ' · ' + esc(inbox) + ' · ' + fmtDate(new Date(r.received_at), tz))
+  }
+  const res = await send(chat, lines.join('\n'))
+  if (res.ok) {
+    for (const r of shown) {
+      await db.from('mailbot_skipped').delete().eq('inbox_id', r.inbox_id).eq('message_id', r.message_id)
+    }
+  }
 }
 
 // ---------------------------------------------------------------- replies --
@@ -991,7 +1067,9 @@ async function handleCron(req: Request): Promise<Response> {
     return json({ error: 'unauthorized' }, 401)
   }
   if (!cfg.owner_chat_id || cfg.paused === 'true') return json({ skipped: true })
-  background(pollAll(cfg).catch((e) => console.error('cron', e)))
+  const job = ((await req.json().catch(() => ({}))) as { job?: string }).job
+  if (job === 'digest') background(sendDigest(cfg, cfg.owner_chat_id, true).catch((e) => console.error('digest', e)))
+  else background(pollAll(cfg).catch((e) => console.error('cron', e)))
   return json({ ok: true })
 }
 
