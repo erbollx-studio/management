@@ -8,14 +8,14 @@ import {
   emailKeyboard,
   type GmailMessage,
   isMuted,
-  matchFilter,
+  matchRules,
   parseAddress,
   parseAddressList,
   readableBody,
   readEmail,
   refFromEntities,
+  parseRules,
   shouldSkip,
-  topicFor,
   wordMatch,
 } from '../supabase/functions/mail-bot/mail.ts'
 
@@ -202,55 +202,52 @@ Deno.test('reply threads correctly; reply-all drops yourself and duplicates', ()
   assert.equal(new TextDecoder().decode(base64urlToBytes(subject)), 'Re: Счёт за октябрь')
 })
 
-Deno.test('words: prefixes, whole words, Russian and ё', () => {
-  assert.ok(wordMatch('Your insurance renewal', 'insurance*'))
-  assert.ok(wordMatch('Продление страхования', 'страхов*'))
+Deno.test('words match at the start of a word, in any case, ё = е', () => {
+  assert.ok(wordMatch('Hi Erbol, see attached', 'erbol'))
+  assert.ok(wordMatch('Payments are due', 'payment'))
+  assert.ok(wordMatch('Продление страхования', 'страхов'))
   assert.ok(wordMatch('Счёт №45 за октябрь', 'счет'))
-  assert.ok(wordMatch('ACH transfer sent', 'ach'))
-  assert.ok(!wordMatch('Achieve more this week', 'ach'))
-  assert.ok(!wordMatch('Счетчик воды', 'счет'))
-  assert.ok(wordMatch('Your wire  transfer is done', 'wire transfer*'))
-  assert.ok(!wordMatch('anything', '*'))
+  assert.ok(wordMatch('Late  payment notice', 'late payment'))
+  assert.ok(!wordMatch('Please display this', 'pay'))
+  assert.ok(!wordMatch('anything', '  '))
 })
 
-Deno.test('filters let through only the chosen topics and say why', () => {
+Deno.test('rules: commas mean any word, + means all words', () => {
+  assert.deepEqual(parseRules('Payment, Erbol; insurance + payment ,  late   payment\nerbol'),
+    ['payment', 'erbol', 'insurance + payment', 'late payment'])
+  assert.deepEqual(parseRules(' , ; '), [])
+})
+
+Deno.test('an email passes if any rule matches anywhere in it', () => {
   const e = readEmail(message())
-  const set = (subject: string, text = '', from = 'Someone <x@y.com>') => {
+  const set = (subject: string, text: string, files: string[] = []) => {
     e.subject = subject
     e.text = text
     e.snippet = ''
-    e.from = parseAddress(from)
+    e.attachments = files.map((name) => ({ name, mimeType: 'application/pdf', size: 1 }))
     return e
   }
-  assert.deepEqual(matchFilter(set('Lunch tomorrow?'), [], []), { pass: true, tags: [] })
-  assert.deepEqual(matchFilter(set('Invoice #4411 for October'), ['payment', 'audit'], []), { pass: true, tags: ['Оплата'] })
-  assert.deepEqual(matchFilter(set('Settlement Report -- for AAJ COM'), ['payment'], []).tags, ['Оплата'])
-  assert.deepEqual(matchFilter(set('COI needed for new load'), ['insurance'], []).tags, ['Страховка'])
-  assert.deepEqual(matchFilter(set('IFTA audit next week'), ['audit'], []).tags, ['Аудит'])
-  assert.deepEqual(matchFilter(set('Оплата по договору', 'Добрый день'), ['payment', 'contracts'], []).tags, ['Оплата', 'Договоры'])
-  assert.equal(matchFilter(set('Lunch tomorrow?'), ['payment', 'insurance'], []).pass, false)
-  // Lookalikes that must not pass.
-  assert.equal(matchFilter(set('Claim your $100 off'), ['insurance'], []).pass, false)
-  assert.equal(matchFilter(set('Quick question', 'Hi', 'Bill Lambert <blambert@aladdincap.com>'), ['payment'], []).pass, false)
-  assert.equal(matchFilter(set('News', 'Hello there. ' + 'x '.repeat(400) + 'Read our privacy policy and invoice terms'), ['payment', 'insurance'], []).pass, false)
-  // Custom words match by word start; the snippet stands in when there is no body.
+  assert.deepEqual(matchRules(set('Lunch?', 'hi'), []), { pass: true, tags: [] })
+  assert.deepEqual(matchRules(set('Payment for insurance', ''), ['erbol', 'insurance + payment']),
+    { pass: true, tags: ['insurance + payment'] })
+  assert.equal(matchRules(set('Payment received', ''), ['insurance + payment']).pass, false)
+  assert.deepEqual(matchRules(set('Docs', 'Hi Erbol, see attached'), ['erbol']).tags, ['erbol'])
+  // The whole body counts, not just the start, and quoted history too.
+  assert.ok(matchRules(set('Update', 'x '.repeat(3000) + 'payment due Friday'), ['payment']).pass)
+  assert.ok(matchRules(set('Re: load', 'ok\n\nOn Mon, Oct 26, 2026 at 10:00 AM Jerry wrote:\n> payment sent'), ['payment']).pass)
+  // Attachment names count.
+  assert.ok(matchRules(set('Docs', 'see attached', ['Invoice_4411.pdf']), ['invoice']).pass)
+  assert.equal(matchRules(set('Weekly news', 'nothing here'), ['payment', 'erbol']).pass, false)
+  // List views have no body: the snippet stands in.
   e.text = ''
   e.subject = 'Weekly update'
-  e.snippet = 'The truck DOT number 1355817 &amp; MC'
-  assert.deepEqual(matchFilter(e, [], ['1355817']), { pass: true, tags: ['«1355817»'] })
-  assert.deepEqual(matchFilter(set('Go USA Trucking update'), [], ['go usa']).tags, ['«go usa»'])
-})
-
-Deno.test('topic names can be typed in English or Russian', () => {
-  assert.equal(topicFor('Оплата'), 'payment')
-  assert.equal(topicFor('insurance'), 'insurance')
-  assert.equal(topicFor(' аудит '), 'audit')
-  assert.equal(topicFor('налоги'), 'taxes')
-  assert.equal(topicFor('lunch'), null)
+  e.snippet = 'Erbol, the truck MC 1355817 is ready'
+  e.attachments = []
+  assert.deepEqual(matchRules(e, ['1355817', 'erbol']).tags, ['1355817', 'erbol'])
 })
 
 Deno.test('the card shows why a filtered email came through', () => {
   const e = readEmail(message())
-  const t = cardText({ inbox: 'info@jolgo.app', email: e, link: 'x', preview: '', timeZone: 'Asia/Bishkek', tags: ['Оплата'] })
-  assert.ok(t.startsWith('📥 <b>info@jolgo.app</b> · 🏷 Оплата\n'), t)
+  const t = cardText({ inbox: 'info@jolgo.app', email: e, link: 'x', preview: '', timeZone: 'Asia/Bishkek', tags: ['payment'] })
+  assert.ok(t.startsWith('📥 <b>info@jolgo.app</b> · 🏷 payment\n'), t)
 })

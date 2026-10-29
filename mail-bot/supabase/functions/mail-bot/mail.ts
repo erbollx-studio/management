@@ -237,80 +237,47 @@ export function decodeEntities(s: string): string {
 
 // --------------------------------------------------------------- filters --
 
-/**
- * Topics an inbox can be limited to. A word ending in * matches any word that
- * starts with it (страхов* → страховка, страхование); other words match only
- * as whole words, so "ach" never matches "achieve" and "bill" isn't in the list
- * at all because it is also a name.
- */
-export const TOPICS: Record<string, { label: string; names: string[]; words: string[] }> = {
-  insurance: {
-    label: 'Страховка',
-    names: ['insurance', 'страховка', 'страхование'],
-    words: ['insurance*', 'insurer*', 'insured', 'coi', 'certificate of insurance', 'policy number', 'policy renewal',
-      'premium*', 'coverage', 'underwrit*', 'endorsement*', 'insurance claim*', 'claim number', 'страхов*', 'полис*'],
-  },
-  payment: {
-    label: 'Оплата',
-    names: ['payment', 'payments', 'оплата', 'платежи', 'invoice', 'invoices'],
-    words: ['payment*', 'paid', 'invoice*', 'receipt*', 'remittance*', 'settlement*', 'ach', 'wire transfer*', 'payout*',
-      'refund*', 'billing', 'factoring', 'over advance', 'оплат*', 'платеж*', 'счет', 'счета', 'инвойс*', 'квитанц*'],
-  },
-  audit: {
-    label: 'Аудит',
-    names: ['audit', 'аудит', 'проверки'],
-    words: ['audit*', 'compliance', 'ifta', 'fmcsa', 'dot audit', 'dot inspection', 'inspection*', 'аудит*', 'проверк*',
-      'ревизи*'],
-  },
-  contracts: {
-    label: 'Договоры',
-    names: ['contracts', 'contract', 'договоры', 'договор'],
-    words: ['contract*', 'agreement*', 'docusign', 'hellosign', 'dropbox sign', 'signature request*', 'please sign', 'nda',
-      'договор*', 'соглашени*', 'подпис*'],
-  },
-  taxes: {
-    label: 'Налоги',
-    names: ['taxes', 'tax', 'налоги', 'налог'],
-    words: ['tax', 'taxes', 'irs', '1099*', 'w-9', 'w9', 'налог*', 'декларац*'],
-  },
-}
-
 /** Lower case, ё → е, so "Счёт" and "счет" are the same word. */
 function fold(s: string): string {
   return s.toLowerCase().replace(/ё/g, 'е')
 }
 
+/**
+ * Whether `word` appears in `text` at the start of a word. A trailing * is
+ * allowed and means the same. Spaces inside `word` match any run of spaces,
+ * so "late payment" finds "late  payment".
+ */
 export function wordMatch(text: string, word: string): boolean {
-  const prefix = word.endsWith('*')
-  const w = fold(prefix ? word.slice(0, -1) : word).trim()
+  const w = fold(word.replace(/\*$/, '')).trim()
   if (!w) return false
   const body = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
-  return new RegExp('(?<![\\p{L}\\p{N}])' + body + (prefix ? '' : '(?![\\p{L}\\p{N}])'), 'u').test(fold(text))
-}
-
-/** The topic a word the user typed names ("оплата", "payment"), if any. */
-export function topicFor(word: string): string | null {
-  const w = fold(word.trim())
-  return Object.keys(TOPICS).find((key) => TOPICS[key].names.includes(w)) ?? null
+  return new RegExp('(?<![\\p{L}\\p{N}])' + body, 'u').test(fold(text))
 }
 
 /**
- * Whether an email passes an inbox's filter, and the labels that let it through.
- * No topics and no keywords means no filter. Only the start of the body is
- * read: footers ("privacy policy", "unsubscribe") would match almost anything.
+ * Filter rules from what the user typed: commas (or new lines) separate rules,
+ * and + joins words that must all be in the email.
+ *   "payment, erbol"          → either word
+ *   "insurance + payment"     → both words
  */
-export function matchFilter(email: Email, topics: string[], keywords: string[]): { pass: boolean; tags: string[] } {
-  if (!topics.length && !keywords.length) return { pass: true, tags: [] }
+export function parseRules(input: string): string[] {
+  const rules = input.split(/[,;\n]+/).map((rule) =>
+    rule.split('+').map((w) => w.trim().replace(/\s+/g, ' ').toLowerCase()).filter(Boolean).join(' + ')
+  )
+  return [...new Set(rules.filter(Boolean))]
+}
+
+/**
+ * Whether an email passes an inbox's rules, and which rules let it through.
+ * No rules means everything passes. The whole email is searched: subject,
+ * sender, full text and attachment names; without a body (list views) the
+ * snippet stands in.
+ */
+export function matchRules(email: Email, rules: string[]): { pass: boolean; tags: string[] } {
+  if (!rules.length) return { pass: true, tags: [] }
   const text = [email.subject, email.from.name, email.from.email,
-    email.text ? readableBody(email, true).slice(0, 600) : email.snippet].join('\n')
-  const tags: string[] = []
-  for (const key of topics) {
-    const topic = TOPICS[key]
-    if (topic && topic.words.some((w) => wordMatch(text, w))) tags.push(topic.label)
-  }
-  for (const k of keywords) {
-    if (wordMatch(text, k.endsWith('*') ? k : k + '*')) tags.push('«' + k + '»')
-  }
+    email.text ? readableBody(email, false) : email.snippet, ...email.attachments.map((a) => a.name)].join('\n')
+  const tags = rules.filter((rule) => rule.split(' + ').every((w) => wordMatch(text, w)))
   return { pass: tags.length > 0, tags }
 }
 
