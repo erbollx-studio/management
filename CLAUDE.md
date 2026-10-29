@@ -1,5 +1,5 @@
-# How to talk to me
+# Как со мной общаться
 
-- Always answer in the simplest English. Short sentences, common words, no jargon.
-- When you work on something, tell me what you are doing in one or two plain sentences.
-- If you must use a technical word, explain it in a few simple words.
+- Всегда отвечай на русском, самыми простыми словами. Короткие предложения, без сложных терминов.
+- Когда что-то делаешь, коротко объясни, что именно, в одном-двух простых предложениях.
+- Если без технического слова не обойтись, объясни его в нескольких простых словах.

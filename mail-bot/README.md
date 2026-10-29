@@ -1,70 +1,68 @@
-# Mail → Telegram bot
+# Бот: почта → Telegram
 
-All your work email in one Telegram chat: **@emailsforerbol_bot**.
+Вся рабочая почта в одном чате Telegram: **@emailsforerbol_bot**.
 
-Each inbox connects with "Sign in with Google". Nothing is forwarded. When an
-email arrives in any connected inbox, the bot posts it to Telegram within about
-a minute. From Telegram you can:
+Каждая почта подключается через «Войти через Google». Ничего не пересылается.
+Когда в любую подключённую почту приходит письмо, бот присылает его в Telegram
+примерно за минуту. Прямо в Telegram можно:
 
-- **✅ Read**: mark it read in that inbox
-- **🗄 Archive**: archive it in that inbox
-- **📄 Full text**: see the whole email
-- **📎 attachments**: arrive as files under the email
-- **🔇 Mute sender**: stop emails from that sender
-- **Reply**: use Telegram's Reply on the email and type. The bot shows the reply
-  first and sends only when you tap **✅ Send**. It goes out from the inbox the
-  email came to.
+- **✅ Прочитано**: отметить письмо прочитанным в этой почте
+- **🗄 В архив**: убрать письмо в архив в этой почте
+- **📄 Весь текст**: показать письмо целиком
+- **📎 вложения**: приходят файлами под письмом
+- **🔇 Заглушить**: больше не показывать письма от этого отправителя
+- **Ответить**: нажми «Ответить» на письме в Telegram и напиши текст. Бот
+  сначала покажет ответ и отправит его только после кнопки **✅ Отправить**.
+  Ответ уходит с той почты, на которую пришло письмо.
 
-Promotions and Social tab mail is skipped.
+Письма из вкладок «Промоакции» и «Соцсети» бот пропускает.
 
-## Commands
+## Команды
 
-| Command | What it does |
+| Команда | Что делает |
 |---|---|
-| `/connect` | Add an inbox (sign in with Google) |
-| `/inboxes` | List connected inboxes |
-| `/disconnect name@company.com` | Remove an inbox |
-| `/unread` | Newest 10 unread emails; tap a number to open one |
-| `/check` | Check all inboxes now |
-| `/mute name@company.com` or `/mute company.com` | Stop emails from a sender or a whole domain |
-| `/unmute …`, `/muted` | Undo a mute, list mutes |
-| `/pause`, `/resume` | Stop or restart notifications |
-| `/status` | Is everything working? |
+| `/connect` | Добавить почту (вход через Google) |
+| `/inboxes` | Список подключённых почт |
+| `/disconnect name@company.com` | Отключить почту |
+| `/unread` | 10 последних непрочитанных; нажми номер, чтобы открыть письмо |
+| `/check` | Проверить все почты сейчас |
+| `/mute name@company.com` или `/mute company.com` | Не показывать письма от человека или целой компании |
+| `/unmute …`, `/muted` | Вернуть заглушённого, список заглушённых |
+| `/pause`, `/resume` | Выключить или включить уведомления |
+| `/status` | Всё ли работает |
 
-## Where it runs
+## Где работает
 
-In the Supabase project **Task Manager** (`vqexlrqphddnnbveppbl`), next to the
-calendar sync. It does not touch the planner tables.
+В проекте Supabase **Task Manager** (`vqexlrqphddnnbveppbl`), рядом с синхронизацией
+календаря. Таблицы планировщика бот не трогает.
 
-- `supabase/functions/mail-bot/index.ts`: the bot (Telegram webhook, Google
-  sign-in, once-a-minute check)
-- `supabase/functions/mail-bot/mail.ts`: reading emails and building replies
-- `supabase/migrations/`: tables (`mailbot_*`), Vault storage for tokens, the cron job
+- `supabase/functions/mail-bot/index.ts`: сам бот (приём сообщений из Telegram,
+  вход через Google, проверка почты раз в минуту)
+- `supabase/functions/mail-bot/mail.ts`: разбор писем и сборка ответов
+- `supabase/migrations/`: таблицы `mailbot_*`, хранилище доступов (Vault), расписание проверки
 
-It reuses the Google login app the calendar sync already has
-(`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`). That Google Cloud project needs:
+Бот использует то же приложение для входа через Google, что и календарь
+(`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`). В этом проекте Google Cloud нужно:
 
-1. **Gmail API** turned on.
-2. This address in the OAuth client's **Authorized redirect URIs**:
+1. Включить **Gmail API**.
+2. Добавить этот адрес в **Authorized redirect URIs** у OAuth-клиента:
    `https://vqexlrqphddnnbveppbl.supabase.co/functions/v1/mail-bot/callback`
 
-Secrets are not in this repo. The bot token and Google refresh tokens are in
-Supabase Vault. The webhook secret, cron token and pairing code are made by the
-migration and live in `mailbot_config`.
+Секретов в этом репозитории нет. Токен бота и доступы к почтам лежат в Supabase
+Vault (зашифрованное хранилище). Секрет для Telegram, ключ для расписания и код
+привязки создаются миграцией и лежат в `mailbot_config`.
 
-Health check (no private data): `GET …/functions/v1/mail-bot/health`
+Проверка, что бот жив (без личных данных): `GET …/functions/v1/mail-bot/health`
 
-## Tests
+## Тесты
 
 ```
 deno test mail-bot/test/
 ```
 
-## Limits
+## Ограничения
 
-- Gmail and Google Workspace inboxes only. Outlook / Microsoft 365 would need a
-  Microsoft login app as well.
-- If Google won't open inside Telegram, copy the `/connect` link into Safari or
-  Chrome.
-- Attachments over 20 MB get a Gmail link instead of a file.
-- Replies are plain text.
+- Только Gmail и Google Workspace. Для Outlook нужно отдельное приложение Microsoft.
+- Если Google не открывается внутри Telegram, скопируй ссылку из `/connect` в Safari или Chrome.
+- Вложения больше 20 МБ приходят ссылкой на Gmail, а не файлом.
+- Ответы только текстом.

@@ -1,3 +1,3 @@
 # management
 
-- [`mail-bot/`](mail-bot/): all your work email in one Telegram chat (Supabase + Gmail sign-in).
+- [`mail-bot/`](mail-bot/): вся рабочая почта в одном чате Telegram (Supabase + вход через Google).

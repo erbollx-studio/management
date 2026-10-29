@@ -191,7 +191,7 @@ export function readableBody(email: Email, stripQuotes: boolean): string {
     .replace(/\r\n?/g, '\n')
     .replace(/<(?:https?:|mailto:)[^>\s]*>/gi, '') // "text <link>" left over from HTML mail
     .replace(/\[image:[^\]]*\]/gi, '')
-    .replace(/[ \t\u00a0]+\n/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n') // trailing spaces, tabs and non-breaking spaces
   if (stripQuotes && !/^\s*(fw|fwd)\s*:/i.test(email.subject)) t = stripQuoted(t)
   return t.replace(/\n{3,}/g, '\n\n').trim()
 }
@@ -243,7 +243,7 @@ export function clip(s: string, n: number): string {
 }
 
 export function fmtDate(d: Date, timeZone: string): string {
-  return new Intl.DateTimeFormat('en-GB', {
+  return new Intl.DateTimeFormat('ru-RU', {
     timeZone,
     day: 'numeric',
     month: 'short',
@@ -273,12 +273,12 @@ export function cardText(o: { inbox: string; email: Email; link: string; preview
     '📥 <b>' + esc(o.inbox) + '</b>',
     '👤 <b>' + esc(email.from.label) + '</b>' + (email.from.name ? ' ' + esc('<' + email.from.email + '>') : ''),
     // The reply flow reads the inbox and Gmail ID back from this link.
-    '✉️ <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(no subject)', 300)) + '</a>',
+    '✉️ <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(без темы)', 300)) + '</a>',
     '🕒 ' + fmtDate(email.date, o.timeZone),
   ]
   if (o.preview) lines.push('', esc(o.preview))
   const n = email.attachments.length
-  if (n) lines.push('', '📎 ' + n + (n === 1 ? ' attachment' : ' attachments'))
+  if (n) lines.push('', '📎 Вложений: ' + n)
   return lines.join('\n')
 }
 
@@ -291,12 +291,12 @@ export interface Button {
 export function emailKeyboard(inboxId: number, id: string, link: string, unread: boolean, archived: boolean): { inline_keyboard: Button[][] } {
   const ref = inboxId + ':' + id
   const row: Button[] = []
-  if (unread && !archived) row.push({ text: '✅ Read', callback_data: 'r:' + ref })
-  if (!archived) row.push({ text: '🗄 Archive', callback_data: 'a:' + ref })
-  row.push({ text: '📄 Full text', callback_data: 'f:' + ref })
+  if (unread && !archived) row.push({ text: '✅ Прочитано', callback_data: 'r:' + ref })
+  if (!archived) row.push({ text: '🗄 В архив', callback_data: 'a:' + ref })
+  row.push({ text: '📄 Весь текст', callback_data: 'f:' + ref })
   return {
     inline_keyboard: [row, [
-      { text: '🔇 Mute sender', callback_data: 'm:' + ref },
+      { text: '🔇 Заглушить', callback_data: 'm:' + ref },
       { text: '↗️ Gmail', url: link },
     ]],
   }

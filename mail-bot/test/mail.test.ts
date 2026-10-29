@@ -121,6 +121,12 @@ Deno.test('preview cuts quoted history, full text and forwards keep it', () => {
   assert.equal(readableBody(ru, true), 'Добрый день, счёт во вложении.')
 })
 
+Deno.test('trailing spaces go, letters at line ends stay', () => {
+  const e = readEmail(message())
+  e.text = 'Hola  \nUna factura\u00a0\nTabu\\\nok'
+  assert.equal(readableBody(e, false), 'Hola\nUna factura\nTabu\\\nok')
+})
+
 Deno.test('shouldSkip keeps inbox mail and drops sent, spam and skipped tabs', () => {
   const skip = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL']
   assert.equal(shouldSkip(['INBOX', 'UNREAD', 'CATEGORY_UPDATES'], skip), false)
@@ -144,8 +150,8 @@ Deno.test('the card escapes HTML and carries the inbox + id in its link', () => 
   const t = cardText({ inbox: 'info@jolgo.app', email: e, link, preview: readableBody(e, true), timeZone: 'Asia/Bishkek' })
   assert.ok(t.startsWith('📥 <b>info@jolgo.app</b>\n👤 <b>Heather G</b> &lt;heatherg@aladdincap.com&gt;'), t)
   assert.ok(t.includes('<a href="' + link + '">FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</a>'), t)
-  assert.ok(t.includes('🕒 26 Oct, 14:32'), t)
-  assert.ok(t.endsWith('📎 1 attachment'), t)
+  assert.ok(t.includes('🕒 26 окт., 14:32'), t)
+  assert.ok(t.endsWith('📎 Вложений: 1'), t)
   assert.deepEqual(refFromEntities([{ type: 'text_link', url: link }]), { inbox: 'info@jolgo.app', id: e.id })
 })
 
