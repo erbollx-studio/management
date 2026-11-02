@@ -224,6 +224,30 @@ const templateCases: [string, string, string, string[], string][] = [
   ['Can you call me?', 'About the load.', 'Heather G <heatherg@aladdincap.com>', [], '⭐ Heather G'],
   ['Booking confirmed', 'Free cancellation. See our cancellation policy and privacy policy.', 'hotel@booking.com', [], ''],
   ['Lunch tomorrow?', 'Are you free at 1?', 'friend@gmail.com', [], ''],
+  // Broker mail: the money and insurance words sit in signatures, footers, load terms and old replies.
+  ['RE: Axle Logistics, LLC Rate Confirmation for 3711257',
+    'Received, the driver is on the way.\n\nThanks,\nKevin Ellis\nAxle Logistics\nPartnering with Jet Capital if you need factoring?',
+    'kevin.ellis@axlelogistics.com', ['image001.jpg'], ''],
+  ['Dry Van: WELLAND, ON → VICTORIA, TX | PU TODAY | $2800',
+    'Pick up today 14:00 in Welland, deliver Thursday in Victoria. 53ft dry van, no hazmat. Driver must have TWIC. ' +
+    'Call me if interested, the shipper is waiting for an answer before noon.\n\nBreanna Kopp\nCarrier Sales\n' +
+    '7400 W 132nd St, Overland Park, KS 66210\n\nWWEX PODS / INVOICES / BILLING: afndispatch@example.com',
+    'breanna.kopp@em.wwex.com', [], ''],
+  ['Re: SPI Logistics - Load documents for load SPT-731186',
+    'Got it, thank you!\n\nTo register or to view your pending payments go to https://secure.example.com',
+    'scarrion@spi3pl.com', [], ''],
+  ['Re: Glade Spring, VA to Amsterdam, NY VIN# 8180-41',
+    'Driver will be there at 8.\n\nOn Mon, Nov 2, 2026 at 9:00 AM Grace <graced@lunkerlogistics.com> wrote:\n' +
+    '> IF ANY DAMAGE IS FOUND IN THE TRAILER, YOU WILL FORFEIT PAYMENT.',
+    'dispatch@rahtrans.com', [], ''],
+  ['Hotshot 40ft loads', 'Dedicated lane, 5 loads a week. Truck will be paid for loaded miles and deadhead. Cargo coverage $100k.',
+    'peter@rxo.com', [], ''],
+  ['Re: IGT Logistics Rate Confirmation for order: 0091544',
+    'Pick-up number policy: for security reasons the number is sent only after the driver checks in. TONU if cancelled.',
+    'ops@igt.com', [], ''],
+  ['You just received a payment from eCapital!💰🎉', 'Hi RAH TRANS INC, a payment was sent to your bank.', 'wallet@ecapital.com',
+    [], '🧾 Invoice / payment'],
+  ['Hi', 'Thanks!\nInvoice for load 4411 is attached, please pay by Friday.', 'ar@broker.com', [], '🧾 Invoice / payment'],
 ]
 
 for (const [subject, body, sender, files, expected] of templateCases) {
@@ -390,12 +414,14 @@ for (const [subject, body, sender, files, expected] of cases) {
   })
 }
 
-Deno.test('the whole email counts; no rules means everything; snippet stands in for lists', () => {
+Deno.test('only the subject, sender, files and first lines count; no rules means everything; snippet for lists', () => {
   const e = readEmail(message())
   e.subject = 'Update'
   e.attachments = []
-  e.text = 'x '.repeat(3000) + 'Erbol, payment due Friday'
+  e.text = 'Erbol, payment due Friday.\n\n' + 'x '.repeat(3000)
   assert.ok(matchRules(e, ['erbol']).pass)
+  e.text = 'x '.repeat(3000) + 'Erbol, payment due Friday'
+  assert.equal(matchRules(e, ['erbol']).pass, false)
   e.text = 'ok\n\nOn Mon, Oct 26, 2026 at 10:00 AM Jerry wrote:\n> erbol said hi'
   assert.ok(matchRules(e, ['erbol']).pass)
   assert.deepEqual(matchRules(e, []), { pass: true, tags: [] })

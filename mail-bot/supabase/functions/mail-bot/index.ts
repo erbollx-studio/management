@@ -877,7 +877,8 @@ async function cmdTemplates(chat: string): Promise<void> {
     '<b>Insurance words:</b> ' + words(INSURANCE_WORDS),
     '<b>Urgent words:</b> ' + words(URGENT_WORDS),
     '',
-    'Words count in the subject, the text and file names. Emails that fit no template go to the daily list (/skipped).',
+    'Words count in the subject, the sender, file names and the first lines of the newest message. ' +
+    'Signatures, footers and old replies don\'t count. Emails that fit no template go to the daily list (/skipped).',
   ].join('\n'), TRASH)
 }
 

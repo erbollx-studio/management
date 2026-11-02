@@ -18,8 +18,14 @@ Every email is sorted into a template, first match wins:
 | ⭐ **Your people** | the sender is on `/people`, whatever the words |
 
 The word lists are `MONEY_WORDS`, `INSURANCE_WORDS` and `URGENT_WORDS` in
-`mail.ts`; `/templates` shows them in Telegram. Footer phrases like "privacy
-policy" and "cancellation policy" don't count.
+`mail.ts`; `/templates` shows them in Telegram.
+
+Words count only in the subject, the sender, file names and the first lines
+of the newest message. Old replies, signatures ("Need factoring?"), short
+contact lines ("INVOICES / BILLING: ap@broker.com"), footers and phrases like
+"privacy policy" don't count. Broker rate confirmations and load offers carry
+payment and insurance words in all of those places, so searching the whole
+email sent nearly every one of them to the chat.
 
 Emails that fit no template go to the daily list, not the chat. Per inbox,
 `/filter` can add extra words that also let emails through, or switch the inbox
@@ -62,8 +68,8 @@ On top of the templates, an inbox can let through emails with its own words.
 
 - **Commas** mean "any rule": `erbol, load 4411`
 - **Plus** means "all words": `broker + rate`
-- Words are searched everywhere: subject, sender, the whole text and file
-  names. Case doesn't matter, and `payment` also finds `payments`.
+- Words are searched where the templates look: subject, sender, file names
+  and the first lines. Case doesn't matter, and `payment` also finds `payments`.
 - **Similar words count too.** `payment` also finds invoice, paid, remittance,
   «оплата», «счёт». The lists are `FAMILIES` in `mail.ts`.
 - Held-back emails aren't lost: the bot sends a list of them every day at

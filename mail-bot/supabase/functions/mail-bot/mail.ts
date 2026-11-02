@@ -345,8 +345,10 @@ export function findWord(text: string, word: string): string {
   const w = fold(prefix ? word.slice(0, -1) : word).trim()
   if (!w) return ''
   const body = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
-  const re = new RegExp('(?<![\\p{L}\\p{N}])' + body + (prefix ? '[\\p{L}\\p{N}]*' : '(?![\\p{L}\\p{N}])'), 'u')
-  return re.exec(fold(text))?.[0] ?? ''
+  // Word edges only where the word itself starts or ends with a letter, so "policy #" finds "policy #A-4411".
+  const head = /^[\p{L}\p{N}]/u.test(w) ? '(?<![\\p{L}\\p{N}])' : ''
+  const tail = prefix ? '[\\p{L}\\p{N}]*' : /[\p{L}\p{N}]$/u.test(w) ? '(?![\\p{L}\\p{N}])' : ''
+  return new RegExp(head + body + tail, 'u').exec(fold(text))?.[0] ?? ''
 }
 
 /** The first of `words` found in `text`, as written there, or ''. */
@@ -363,10 +365,34 @@ function findRuleWord(text: string, word: string): string {
   return firstWord(text, familyOf(word) ?? [word.endsWith('*') ? word : word + '*'])
 }
 
-/** What templates and word filters search: subject, sender, the whole text (or the snippet) and file names. */
+/** Where a signature starts: a line that is "--", "Thanks," / "Thanks, Grace", "Best regards" or "Sent from my iPhone". */
+const SIGNATURE =
+  /^[ \t]*(--[ \t]*$|(thanks|thank you|thx|regards|best|best regards|kind regards|warm regards|sincerely|cheers|respectfully|спасибо|с уважением)[ \t]*(,[^\n]{0,30}|[.!]*)[ \t]*$|sent from my )/im
+
+/** An address, a link or a phone number: on a short line, that line is a signature or footer line. */
+const CONTACT = /\S@\S+\.\w|https?:\/\/|www\.|\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}/i
+
+/**
+ * The first lines of the newest message: old replies, the signature and
+ * everything after it are cut off, short contact lines ("INVOICES / BILLING:
+ * ap@broker.com", "view your pending payments at https://…") are skipped,
+ * then the first `n` characters are kept. Broker signatures ("Need
+ * factoring?"), footers and load terms ("you will forfeit payment") sit
+ * there, so they don't decide anything.
+ */
+export function opening(email: Email, n = 300): string {
+  if (!email.text) return email.snippet.slice(0, n)
+  const body = readableBody(email, true)
+  // A "Thanks!" as the very first line is the message, not the signature.
+  const sig = body.slice(40).search(SIGNATURE)
+  return (sig >= 0 ? body.slice(0, 40 + sig) : body).split('\n')
+    .filter((line) => line.length >= 100 || !CONTACT.test(line)).join('\n').slice(0, n)
+}
+
+/** What templates and word filters search: subject, sender, file names and the first lines of the newest message. */
 function searchText(email: Email): string {
-  return [email.subject, email.from.name, email.from.email,
-    email.text ? readableBody(email, false) : email.snippet, ...email.attachments.map((a) => a.name)].join('\n')
+  return [email.subject, email.from.name, email.from.email, ...email.attachments.map((a) => a.name), opening(email)]
+    .join('\n')
 }
 
 /**
@@ -385,9 +411,9 @@ export function parseRules(input: string): string[] {
 /**
  * Whether an email passes an inbox's rules, and the words that let it through
  * (as found in the email, e.g. "invoice + premium" for "payment + insurance").
- * No rules means everything passes. The whole email is searched: subject,
- * sender, full text and attachment names; without a body (list views) the
- * snippet stands in.
+ * No rules means everything passes. The subject, sender, file names and the
+ * first lines of the newest message are searched; without a body (list views)
+ * the snippet stands in.
  */
 export function matchRules(email: Email, rules: string[]): { pass: boolean; tags: string[] } {
   if (!rules.length) return { pass: true, tags: [] }
@@ -403,20 +429,23 @@ export function matchRules(email: Email, rules: string[]): { pass: boolean; tags
 // ------------------------------------------------------------- templates --
 
 /**
- * The words behind the templates, written as for findWord. "bill" alone is
- * left out because it is also a name, and "premium" and "renewal" count only
- * in phrases, because "Premium plan" and "subscription renewal" ads would
- * otherwise read as insurance.
+ * The words behind the templates, written as for findWord. Words that broker
+ * load offers and rate confirmations use for other things are left out or
+ * kept only as phrases: "paid" ("truck will be paid per mile"), "billing",
+ * "factoring", "balance", "coverage" ("cargo coverage $100k") and "policy"
+ * ("pick-up number policy"). "bill" alone is also a name, and "Premium plan"
+ * ads would read as insurance.
  */
 export const MONEY_WORDS = [
-  'payment*', 'paid', 'invoice*', 'receipt*', 'remittance*', 'settlement*', 'factoring', 'statement*',
-  'ach', 'wire', 'wired', 'wire transfer*', 'amount due', 'balance', 'billing', 'past due', 'premium due',
+  'payment*', 'invoice*', 'receipt*', 'remittance*', 'settlement*', 'statement*', 'ach', 'wire transfer*', 'wired',
+  'amount due', 'amount paid', 'balance due', 'outstanding balance', 'paid in full', 'past due', 'premium due',
   'оплат*', 'платеж*', 'счет', 'счета', 'инвойс*', 'квитанц*',
 ]
 export const INSURANCE_WORDS = [
-  'insur*', 'policy', 'policies', 'policyholder*', 'policy renewal', 'coverage', 'coi', 'certificate of insurance',
-  'certificate holder', 'endorsement*', 'underwrit*', 'premium due', 'premium notice', 'premium payment',
-  'annual premium', 'monthly premium', 'premiums', 'страхов*', 'полис*',
+  'insur*', 'policy #', 'policy no', 'policy number', 'policy period', 'policy renewal', 'your policy',
+  'policyholder*', 'coi', 'certificate of insurance', 'certificate holder', 'endorsement*', 'underwrit*',
+  'premium due', 'premium notice', 'premium payment', 'annual premium', 'monthly premium', 'premiums',
+  'страхов*', 'полис*',
 ]
 export const URGENT_WORDS = [
   'past due', 'overdue', 'final notice', 'cancellation', 'cancelled', 'canceled', 'non-payment', 'nonpayment',
