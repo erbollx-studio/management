@@ -6,19 +6,40 @@ Each inbox connects with "Sign in with Google". Nothing is forwarded. When an
 email arrives in any connected inbox, the bot posts it to Telegram within about
 a minute.
 
+## Templates
+
+Every email is sorted into a template, first match wins:
+
+| Template | When |
+|---|---|
+| 🔴 **Insurance · URGENT** | an insurance word and an urgent word (past due, final notice, cancellation, non-payment, lapse…) |
+| 💰 **Insurance payment** | a money word and an insurance word |
+| 🧾 **Invoice / payment** | a money word |
+| ⭐ **Your people** | the sender is on `/people`, whatever the words |
+
+The word lists are `MONEY_WORDS`, `INSURANCE_WORDS` and `URGENT_WORDS` in
+`mail.ts`; `/templates` shows them in Telegram. Footer phrases like "privacy
+policy" and "cancellation policy" don't count.
+
+Emails that fit no template go to the daily list, not the chat. Per inbox,
+`/filter` can add extra words that also let emails through, or switch the inbox
+to all emails.
+
 ## What an email looks like
 
-Who sent it, to which inbox, the subject and the first lines:
-
 ```
-Heather G → info@dancargologisticsinc.com
-FactorGenie System & TMS Integration
-Hi Erbol, FTP details attached. Please confirm the setup by Friday …
+🔴 Insurance payment · URGENT
+From: Anna Lee · anna@truckinsure.com
+To: Dan Cargo · info@dancargologisticsinc.com
+Subject: Final notice: policy #A-4411 past due
+Your premium of $1,850 was due Oct 30. Coverage will be cancelled on …
 [▾ More] [🗑 Delete] [🔕 Stop]
 ```
 
-- **▾ More** opens the rest in the same message: the time, the filter words
-  that matched, and more of the text. **▴ Less** folds it back.
+The subject links to the email in Gmail. The inbox name comes from Gmail.
+
+- **▾ More** opens the rest in the same message: the time, the words that
+  chose the template, and more of the text. **▴ Less** folds it back.
 - **📄 Full text** shows the whole text (long emails are cut; the rest is in Gmail).
 - **📎 N** sends the email's files. Files never come on their own.
 - **🗄 Archive** archives it in Gmail and removes it from the chat.
@@ -35,21 +56,18 @@ Hi Erbol, FTP details attached. Please confirm the setup by Friday …
 Other bot messages (files, lists, confirmations) have a 🗑 button too, so the
 chat stays clean. Emails in the Promotions and Social tabs are skipped.
 
-## Filters by words
+## Extra words per inbox
 
-Any inbox can be limited to emails that contain certain words.
+On top of the templates, an inbox can let through emails with its own words.
 
-- **Commas** mean "any rule": `payment, erbol`
-- **Plus** means "all words": `payment + insurance`
+- **Commas** mean "any rule": `erbol, load 4411`
+- **Plus** means "all words": `broker + rate`
 - Words are searched everywhere: subject, sender, the whole text and file
   names. Case doesn't matter, and `payment` also finds `payments`.
 - **Similar words count too.** `payment` also finds invoice, paid, remittance,
-  «оплата», «счёт»; `insurance` also finds premium, COI, «страховка». The lists
-  are `FAMILIES` in `mail.ts`.
+  «оплата», «счёт». The lists are `FAMILIES` in `mail.ts`.
 - Held-back emails aren't lost: the bot sends a list of them every day at
   20:00 (Bishkek), and `/skipped` shows it any time.
-
-An inbox without words gets all its emails.
 
 ## Commands
 
@@ -59,9 +77,12 @@ An inbox without words gets all its emails.
 | `/inboxes` | Connected inboxes and their filters |
 | `/disconnect name@company.com` | Remove an inbox |
 | `/unread` | Newest 10 unread emails; tap a number to open one |
-| `/filter` | Filter by words: tap an inbox, type the words |
-| `/filter name@company.com payment, erbol` | The same in one command; `all` removes the filter |
-| `/skipped` | Emails the filters held back |
+| `/templates` | The templates and their words |
+| `/people` | Your ⭐ people; tap one to remove |
+| `/people name@company.com Anna Lee, insurance agent` | Add a person (or `company.com` for everyone there) |
+| `/filter` | Per inbox: templates only, extra words, or all emails |
+| `/filter name@company.com erbol, load 4411` | The same in one command; `all` or `templates` switch the mode |
+| `/skipped` | Emails that fit no template |
 | `/muted` | What you stopped with 🔕; tap one to undo |
 | `/check` | Check all inboxes now |
 | `/pause`, `/resume` | Stop or restart notifications |

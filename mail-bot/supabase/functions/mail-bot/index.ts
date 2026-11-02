@@ -4,6 +4,7 @@ import {
   base64urlToBytes,
   buildReply,
   cardText,
+  classify,
   clip,
   decodeEntities,
   describeMute,
@@ -12,10 +13,13 @@ import {
   esc,
   fmtDate,
   gmailLink,
+  inboxName,
+  INSURANCE_WORDS,
   isMuted,
-  matchRules,
+  MONEY_WORDS,
   muteEntry,
   parseRules,
+  type Person,
   preview,
   readableBody,
   readEmail,
@@ -23,14 +27,18 @@ import {
   shouldSkip,
   similarWords,
   stopKeyboard,
+  URGENT_WORDS,
   type Attachment,
   type Button,
 } from './mail.ts'
 
 /**
  * Mail bot: posts new mail from every connected inbox to one Telegram chat and
- * acts on it from there. Each email arrives as a short card ("Sender → inbox",
- * the subject, the first lines); ▾ More shows the rest, 🗑 removes it from the
+ * acts on it from there. Each email is sorted into a template (🔴 urgent
+ * insurance, 💰 insurance payment, 🧾 invoice / payment, ⭐ your people) and
+ * arrives as a short card: the template, From and To, the subject, the first
+ * lines. Emails that fit no template go to the daily list instead, unless the
+ * inbox is set to all emails. ▾ More shows the rest, 🗑 removes it from the
  * chat, 🔕 stops emails like it. Each inbox connects with Google sign-in;
  * nothing is forwarded anywhere.
  *
@@ -64,7 +72,7 @@ const REPLY_HEADERS = ['From', 'Reply-To', 'To', 'Cc', 'Subject', 'Message-ID', 
 
 const SKIP_CATEGORIES = ['CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL']
 const SKIP_QUERY = '-category:promotions -category:social'
-const CARD_CHARS = 300
+const CARD_CHARS = 200
 const PREVIEW_CHARS = 1200
 const FULL_CHARS = 3300
 const MAX_EMAILS_PER_RUN = 15
@@ -84,8 +92,10 @@ const HELP = [
   '/inboxes: connected inboxes',
   '/disconnect name@company.com: remove an inbox',
   '/unread: latest unread emails',
-  '/filter: only get emails with certain words (payment, erbol, payment + insurance)',
-  '/skipped: emails your filters held back',
+  '/templates: what 🔴 💰 🧾 ⭐ look for',
+  '/people: your ⭐ people, their emails always come through',
+  '/filter: per inbox: templates only, extra words, or all emails',
+  '/skipped: emails that fit no template (the daily list)',
   '/muted: what you stopped with 🔕, tap to undo',
   '/check: check all inboxes now',
   '/pause, /resume: stop or restart notifications',
@@ -110,6 +120,15 @@ interface Inbox {
   status: string
   last_error: string | null
   keywords: string[]
+  /** templates: only template emails and the inbox's own words come through. all: every email does. */
+  mode: 'templates' | 'all'
+}
+
+/** What sorting emails and drawing cards needs besides the email itself. */
+interface Ctx {
+  tz: string
+  muted: string[]
+  people: Person[]
 }
 
 // ---------------------------------------------------------------- helpers --
@@ -172,6 +191,14 @@ async function setConfig(key: string, value: string): Promise<void> {
 async function loadMuted(): Promise<string[]> {
   const { data } = await db.from('mailbot_muted').select('entry')
   return (data ?? []).map((r) => r.entry)
+}
+
+async function loadCtx(cfg: Config): Promise<Ctx> {
+  const [muted, { data: people }] = await Promise.all([
+    loadMuted(),
+    db.from('mailbot_people').select('entry, name, note'),
+  ])
+  return { tz: cfg.time_zone || DEFAULT_TIME_ZONE, muted, people: (people ?? []) as Person[] }
 }
 
 async function connectedInboxes(): Promise<Inbox[]> {
@@ -360,11 +387,10 @@ async function fetchEmail(ib: Inbox, id: string): Promise<Email> {
 
 async function pollAll(cfg: Config): Promise<number> {
   const chat = cfg.owner_chat_id
-  const tz = cfg.time_zone || DEFAULT_TIME_ZONE
-  const muted = await loadMuted()
+  const ctx = await loadCtx(cfg)
   const counts = await Promise.all((await connectedInboxes()).map(async (ib) => {
     try {
-      return await pollInbox(ib, chat, muted, tz)
+      return await pollInbox(ib, chat, ctx)
     } catch (e) {
       console.error('poll', ib.email, e)
       const message = errorText(e).slice(0, 500)
@@ -388,8 +414,9 @@ async function pollAll(cfg: Config): Promise<number> {
  * Posts what arrived since the inbox's history cursor. Gmail's history API
  * lists only additions, so a quiet inbox costs one small call a minute.
  */
-async function pollInbox(ib: Inbox, chat: string, muted: string[], tz: string): Promise<number> {
+async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
   const now = new Date().toISOString()
+  if (ib.label === null) await rememberInboxName(ib)
   if (!ib.history_id) {
     const profile = await gmail(ib, 'profile', undefined, chat)
     await db.from('mailbot_inboxes').update({ history_id: String(profile.historyId), last_checked_at: now, last_error: null })
@@ -410,7 +437,7 @@ async function pollInbox(ib: Inbox, chat: string, muted: string[], tz: string): 
       // 404: the cursor aged out (Gmail keeps about a week). Start again from now.
       if (e instanceof GmailError && e.status === 404) {
         ib.history_id = null
-        return await pollInbox(ib, chat, muted, tz)
+        return await pollInbox(ib, chat, ctx)
       }
       throw e
     }
@@ -439,7 +466,7 @@ async function pollInbox(ib: Inbox, chat: string, muted: string[], tz: string): 
     for (const id of batch) {
       if (!mine.has(id)) continue
       try {
-        if (await deliver(ib, id, chat, muted, tz)) posted++
+        if (await deliver(ib, id, chat, ctx)) posted++
       } catch (e) {
         if (e instanceof GmailError && e.status === 404) continue // deleted before we got to it
         console.error('deliver', ib.email, id, e)
@@ -458,12 +485,27 @@ async function pollInbox(ib: Inbox, chat: string, muted: string[], tz: string): 
   return posted
 }
 
-async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz: string): Promise<boolean> {
+/** The inbox's name for the To line, asked from Gmail once; '' when Gmail has none. */
+async function rememberInboxName(ib: Inbox): Promise<void> {
+  let name = ''
+  try {
+    const { sendAs } = await gmail(ib, 'settings/sendAs')
+    // deno-lint-ignore no-explicit-any
+    const self = (sendAs ?? []).find((s: any) => s.isPrimary || String(s.sendAsEmail).toLowerCase() === ib.email)
+    name = String(self?.displayName ?? '').trim()
+  } catch (e) {
+    console.error('inbox name', ib.email, e)
+  }
+  ib.label = name
+  await db.from('mailbot_inboxes').update({ label: name }).eq('id', ib.id)
+}
+
+async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx): Promise<boolean> {
   const email = readEmail(await gmail(ib, `messages/${id}?format=full`, undefined, chat))
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
-  if (isMuted(muted, email.from.email, email.subject)) return false
-  if (!matchRules(email, ib.keywords).pass) {
+  if (isMuted(ctx.muted, email.from.email, email.subject)) return false
+  if (ib.mode !== 'all' && classify(email, ctx.people, ib.keywords).kind === 'none') {
     // Held back, not lost: the daily digest and /skipped list these.
     await db.from('mailbot_skipped').upsert({
       inbox_id: ib.id,
@@ -474,16 +516,22 @@ async function deliver(ib: Inbox, id: string, chat: string, muted: string[], tz:
     })
     return false
   }
-  await postCard(ib, email, chat, tz, 'min')
+  await postCard(ib, email, chat, ctx, 'min')
   return true
 }
 
 // ------------------------------------------------------------------ cards --
 
-function cardFor(ib: Inbox, email: Email, tz: string, view: View): string {
-  const base = { inbox: ib.label || ib.email, email, link: gmailLink(ib.email, email.id), timeZone: tz }
+function cardFor(ib: Inbox, email: Email, ctx: Ctx, view: View): string {
+  const { label, tags } = classify(email, ctx.people, ib.keywords)
+  const base = {
+    label,
+    email,
+    inbox: { email: ib.email, name: inboxName(ib.label, ib.email, email) },
+    link: gmailLink(ib.email, email.id),
+    timeZone: ctx.tz,
+  }
   if (view === 'min') return cardText({ ...base, body: preview(email, CARD_CHARS) })
-  const tags = matchRules(email, ib.keywords).tags
   if (view === 'more') {
     return cardText({ ...base, details: true, tags, body: clip(readableBody(email, true), PREVIEW_CHARS) })
   }
@@ -497,16 +545,15 @@ function cardButtons(ib: Inbox, email: Email, view: View): { inline_keyboard: Bu
     Math.min(email.attachments.length, MAX_ATTACHMENTS))
 }
 
-async function postCard(ib: Inbox, email: Email, chat: string, tz: string, view: View): Promise<void> {
-  const res = await send(chat, cardFor(ib, email, tz, view), cardButtons(ib, email, view))
+async function postCard(ib: Inbox, email: Email, chat: string, ctx: Ctx, view: View): Promise<void> {
+  const res = await send(chat, cardFor(ib, email, ctx, view), cardButtons(ib, email, view))
   if (!res.ok) throw new TelegramError(res)
 }
 
 // deno-lint-ignore no-explicit-any
 async function showCard(q: any, ib: Inbox, id: string, view: View, cfg: Config): Promise<void> {
-  const email = await fetchEmail(ib, id)
-  await edit(q.message.chat.id, q.message.message_id, cardFor(ib, email, cfg.time_zone || DEFAULT_TIME_ZONE, view),
-    cardButtons(ib, email, view))
+  const [email, ctx] = await Promise.all([fetchEmail(ib, id), loadCtx(cfg)])
+  await edit(q.message.chat.id, q.message.message_id, cardFor(ib, email, ctx, view), cardButtons(ib, email, view))
 }
 
 /** 📎: the files of one email, each as a document with its own 🗑. */
@@ -596,6 +643,10 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdUnread(cfg, chat)
     case '/filter':
       return await cmdFilter(chat, arg)
+    case '/templates':
+      return await cmdTemplates(chat)
+    case '/people':
+      return await cmdPeople(chat, arg)
     case '/skipped':
       return await sendDigest(cfg, chat, false)
     case '/check': {
@@ -646,7 +697,7 @@ async function cmdConnect(chat: string, hint: string): Promise<void> {
 }
 
 async function cmdInboxes(chat: string): Promise<void> {
-  const { data } = await db.from('mailbot_inboxes').select('email, status, last_error, keywords').order('id')
+  const { data } = await db.from('mailbot_inboxes').select('email, status, last_error, keywords, mode').order('id')
   if (!data?.length) {
     await send(chat, 'No inboxes yet. Send /connect to add one.')
     return
@@ -691,7 +742,7 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
     await send(chat, 'No inboxes connected yet. Send /connect.')
     return
   }
-  const muted = await loadMuted()
+  const ctx = await loadCtx(cfg)
   let total = 0
   const lists = await Promise.all(inboxes.map(async (ib) => {
     try {
@@ -702,7 +753,8 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
         gmail(ib, `messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`)
       ))
       return msgs.map((m) => ({ ib, email: readEmail(m) }))
-        .filter((x) => !isMuted(muted, x.email.from.email, x.email.subject) && matchRules(x.email, ib.keywords).pass)
+        .filter((x) => !isMuted(ctx.muted, x.email.from.email, x.email.subject) &&
+          (ib.mode === 'all' || classify(x.email, ctx.people, ib.keywords).kind !== 'none'))
     } catch (e) {
       console.error('unread', ib.email, e)
       return []
@@ -713,7 +765,7 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
     await send(chat, '📭 No unread emails.', TRASH)
     return
   }
-  const tz = cfg.time_zone || DEFAULT_TIME_ZONE
+  const tz = ctx.tz
   const lines = ['📬 <b>Unread</b> (about ' + total + '). Newest first, tap a number to open one here.', '']
   const buttons: Button[] = []
   items.forEach(({ ib, email }, i) => {
@@ -764,6 +816,71 @@ async function cmdMuted(chat: string): Promise<void> {
   await send(chat, list.text, list.markup)
 }
 
+/** /people name@company.com Anna Lee, insurance agent: adds or updates one; /people alone lists them. */
+async function cmdPeople(chat: string, arg: string): Promise<void> {
+  let added = ''
+  if (arg) {
+    const [first, ...rest] = arg.split(/\s+/)
+    const entry = first.toLowerCase().replace(/^@/, '')
+    if (!/^([^\s@]+@)?[^\s@]+\.[^\s@]+$/.test(entry)) {
+      await send(chat, 'Usage: /people name@company.com Name, what they do\nOr a whole company: /people company.com Name')
+      return
+    }
+    const [name, ...note] = rest.join(' ').split(/\s*(?:,|·|\s-\s)\s*/)
+    const person = { entry, name: (name ?? '').trim(), note: note.join(', ').trim() }
+    const { error } = await db.from('mailbot_people').upsert(person, { onConflict: 'entry' })
+    if (error) throw new Error('people: ' + error.message)
+    added = '✅ Added ' + esc(person.name || entry) + '.\n\n'
+  }
+  const list = await peopleList()
+  await send(chat, added + list.text, list.markup)
+}
+
+async function peopleList(): Promise<{ text: string; markup: { inline_keyboard: Button[][] } }> {
+  const { data, error } = await db.from('mailbot_people').select('id, entry, name, note').order('created_at')
+  if (error) throw new Error('people: ' + error.message)
+  const all = data ?? []
+  const add = 'Add someone: <code>/people name@company.com Anna Lee, insurance agent</code>\n' +
+    'Everyone at a company: <code>/people company.com Truck Insure</code>'
+  if (!all.length) return { text: '⭐ <b>Your people</b>: nobody yet.\n\n' + add, markup: TRASH }
+  const rows = all.slice(0, 50)
+  return {
+    text: [
+      '⭐ <b>Your people</b>. Their emails always come through.',
+      '',
+      ...rows.map((p) => '• ' + esc([p.name, p.note].filter(Boolean).join(' · ') || p.entry) + (p.name ? ': ' + esc(p.entry) : '')),
+      '',
+      add,
+      'Tap a name to remove it.',
+    ].join('\n'),
+    markup: {
+      inline_keyboard: [
+        ...rows.map((p) => [{ text: '✖ ' + clip(p.name || p.entry, 50), callback_data: 'P:' + p.id }]),
+        [{ text: '🗑', callback_data: 'X' }],
+      ],
+    },
+  }
+}
+
+/** /templates: what each template looks for, straight from the word lists. */
+async function cmdTemplates(chat: string): Promise<void> {
+  const words = (list: string[]) => esc(list.map((w) => w.replace(/\*$/, '')).join(', '))
+  await send(chat, [
+    '<b>Templates</b>. Every email is checked in this order:',
+    '',
+    '🔴 <b>Insurance · URGENT</b>: an insurance word and an urgent word',
+    '💰 <b>Insurance payment</b>: a money word and an insurance word',
+    '🧾 <b>Invoice / payment</b>: a money word',
+    '⭐ <b>Your people</b>: anyone on /people, whatever the words',
+    '',
+    '<b>Money words:</b> ' + words(MONEY_WORDS),
+    '<b>Insurance words:</b> ' + words(INSURANCE_WORDS),
+    '<b>Urgent words:</b> ' + words(URGENT_WORDS),
+    '',
+    'Words count in the subject, the text and file names. Emails that fit no template go to the daily list (/skipped).',
+  ].join('\n'), TRASH)
+}
+
 async function cmdStatus(cfg: Config, chat: string): Promise<void> {
   const { data } = await db.from('mailbot_inboxes').select('status, last_error, last_checked_at')
   const rows = data ?? []
@@ -801,12 +918,18 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
       } catch (e) {
         console.error('mark read on delete', e)
       }
-    } else if (act === 'e' || act === 'z' || act === 'x') {
-      toast = await onFilterButton(q, act === 'e' ? 'e' : 'z', a)
+    } else if (act === 'e' || act === 'z' || act === 'w' || act === 'x') {
+      toast = await onFilterButton(q, act === 'x' ? 'z' : act, a)
     } else if (act === 'q') {
       const { data: gone } = await db.from('mailbot_muted').delete().eq('id', Number(a)).select('entry').maybeSingle()
       if (gone) toast = 'Back on: ' + describeMute(gone.entry)
       const list = await mutedList()
+      await edit(chat, messageId, list.text, list.markup)
+    } else if (act === 'P') {
+      const { data: gone } = await db.from('mailbot_people').delete().eq('id', Number(a)).select('entry, name')
+        .maybeSingle()
+      if (gone) toast = 'Removed ' + (gone.name || gone.entry)
+      const list = await peopleList()
       await edit(chat, messageId, list.text, list.markup)
     } else if (act === 'y' || act === 'Y') {
       toast = await sendPendingReply(q, a, act === 'Y')
@@ -875,11 +998,11 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
       const email = await fetchEmail(ib, id)
       const entry = muteEntry(email, kind ?? 's')
       if (entry) await db.from('mailbot_muted').delete().eq('entry', entry)
-      await edit(chat, messageId, cardFor(ib, email, cfg.time_zone || DEFAULT_TIME_ZONE, 'min'), cardButtons(ib, email, 'min'))
+      await edit(chat, messageId, cardFor(ib, email, await loadCtx(cfg), 'min'), cardButtons(ib, email, 'min'))
       return 'Back on'
     }
     case 'o':
-      await postCard(ib, await fetchEmail(ib, id), chat, cfg.time_zone || DEFAULT_TIME_ZONE, 'more')
+      await postCard(ib, await fetchEmail(ib, id), chat, await loadCtx(cfg), 'more')
       return ''
   }
   return ''
@@ -888,7 +1011,8 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
 // ---------------------------------------------------------------- filters --
 
 function describeFilter(ib: Inbox): string {
-  return ib.keywords?.length ? ib.keywords.join(', ') : 'all mail'
+  if (ib.mode === 'all') return 'all emails'
+  return 'templates' + (ib.keywords?.length ? ' + your words: ' + ib.keywords.join(', ') : ' only')
 }
 
 /** A rule as the user should read it: "payment (and similar: pay, paid, invoice…) + insurance (…)". */
@@ -906,22 +1030,28 @@ async function filterTargets(target: string): Promise<Inbox[]> {
   return target === 'all' ? inboxes : inboxes.filter((ib) => String(ib.id) === target)
 }
 
-/** Replaces the target inboxes' rules with what the user typed; "all" / "off" removes the filter. */
+/**
+ * Sets what the target inboxes send to Telegram: "all" for every email,
+ * "templates" for template emails only, or words that also let other emails
+ * through (they replace the old words).
+ */
 async function applyFilter(chat: string, target: string, input: string): Promise<void> {
   const inboxes = await filterTargets(target)
   if (!inboxes.length) {
     await send(chat, 'That inbox is no longer connected. See /inboxes')
     return
   }
-  const rules = /^\s*(off|all|none|все|выкл|нет)\s*$/i.test(input) ? [] : parseRules(input)
-  await db.from('mailbot_inboxes').update({ keywords: rules }).in('id', inboxes.map((ib) => ib.id))
-  const who = target === 'all' ? 'all inboxes' : inboxes[0].email
-  if (!rules.length) {
-    await send(chat, '✅ ' + esc(who) + ': you get all emails now.', TRASH)
+  const all = /^\s*(all|все)\s*$/i.test(input)
+  const rules = all || /^\s*(templates|none|off)\s*$/i.test(input) ? [] : parseRules(input)
+  await db.from('mailbot_inboxes').update({ keywords: rules, mode: all ? 'all' : 'templates' })
+    .in('id', inboxes.map((ib) => ib.id))
+  const who = '<b>' + esc(target === 'all' ? 'All inboxes' : inboxes[0].email) + '</b>'
+  if (all) {
+    await send(chat, '✅ ' + who + ': you get every email now. Templates still mark the ones they know.', TRASH)
     return
   }
   await send(chat, [
-    '✅ <b>' + esc(who) + '</b>: you only get emails that have',
+    '✅ ' + who + ': you get the template emails (🔴 💰 🧾 ⭐)' + (rules.length ? ', and emails that have' : ' only.'),
     ...rules.map((r) => '• ' + esc(describeRule(r))),
     '',
     'The rest isn\'t lost: you get a list of them every day. To see it now: /skipped',
@@ -947,16 +1077,20 @@ async function askFilterWords(chat: string, target: string): Promise<void> {
   await setConfig('awaiting_filter', target + '|' + Date.now())
   const who = target === 'all' ? 'all inboxes' : inboxes[0].email
   await send(chat, [
-    '✏️ Type the words for <b>' + esc(who) + '</b> in one message.',
+    '✏️ <b>' + esc(who) + '</b>',
     ...(target === 'all' ? [] : ['Now: ' + esc(describeFilter(inboxes[0]))]),
     '',
-    'An email comes through if it matches at least one rule.',
-    'Commas, if any word is enough: <code>payment, erbol</code>',
-    'Plus, if both words must be there: <code>payment + insurance</code>',
-    'Similar words count too: payment also finds invoice and «оплата».',
-    '',
-    'The new list replaces the old one.',
-  ].join('\n'), { inline_keyboard: [[{ text: '🌐 All emails (no filter)', callback_data: 'z:' + target }]] })
+    'Template emails always come through (🔴 💰 🧾 ⭐, see /templates).',
+    'To also get other emails with certain words, type them in one message:',
+    'Commas, if any word is enough: <code>erbol, load 4411</code>',
+    'Plus, if both words must be there: <code>broker + rate</code>',
+    'The new words replace the old ones.',
+  ].join('\n'), {
+    inline_keyboard: [[
+      { text: '📋 Templates only', callback_data: 'w:' + target },
+      { text: '🌐 All emails', callback_data: 'z:' + target },
+    ]],
+  })
 }
 
 async function cmdFilter(chat: string, arg: string): Promise<void> {
@@ -977,8 +1111,9 @@ async function cmdFilter(chat: string, arg: string): Promise<void> {
     const words = rest.join(' ').trim()
     return words ? await applyFilter(chat, target, words) : await askFilterWords(chat, target)
   }
-  const lines = ['🏷 <b>Filters</b>', '', ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
-    'Tap an inbox and type the words. Emails without them won\'t come to Telegram.']
+  const lines = ['🏷 <b>What comes to Telegram</b>', '',
+    ...inboxes.map((ib) => esc(ib.email) + ': ' + esc(describeFilter(ib))), '',
+    'Tap an inbox to change it: templates only, extra words, or all emails. /templates shows the template words.']
   const rows: Button[][] = inboxes.map((ib) => [{ text: '✏️ ' + ib.email, callback_data: 'e:' + ib.id }])
   if (inboxes.length > 1) rows.push([{ text: '✏️ All inboxes at once', callback_data: 'e:all' }])
   await send(chat, lines.join('\n'), { inline_keyboard: rows })
@@ -992,8 +1127,8 @@ async function onFilterButton(q: any, act: string, target: string): Promise<stri
     return ''
   }
   await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
-  await applyFilter(chat, target, 'all')
-  return 'Filter removed'
+  await applyFilter(chat, target, act === 'w' ? 'templates' : 'all')
+  return act === 'w' ? 'Templates only' : 'All emails'
 }
 
 /**
@@ -1013,8 +1148,8 @@ async function sendDigest(cfg: Config, chat: string, scheduled: boolean): Promis
   const tz = cfg.time_zone || DEFAULT_TIME_ZONE
   const shown = rows.slice(0, DIGEST_ITEMS)
   const lines = [
-    '📋 <b>Filters held back ' + rows.length + '</b>' + (rows.length > shown.length ? ' (latest ' + shown.length + ' here)' : ''),
-    'Anything important? Add a word with /filter.',
+    '📋 <b>' + rows.length + ' emails fit no template</b>' + (rows.length > shown.length ? ' (latest ' + shown.length + ' here)' : ''),
+    'Anything important? Add the sender with /people, or a word with /filter.',
     '',
   ]
   for (const r of shown) {

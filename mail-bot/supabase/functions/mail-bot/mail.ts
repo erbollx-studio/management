@@ -111,6 +111,12 @@ export function subjectKey(subject: string): string {
     .slice(0, 80)
 }
 
+/** Whether an address is `entry`: the same address, or anyone at `entry` when it is a domain. */
+function matchesEntry(entry: string, email: string): boolean {
+  if (entry === email) return true
+  return !entry.includes('@') && (email.endsWith('@' + entry) || email.endsWith('.' + entry))
+}
+
 /**
  * Mute entries come in three kinds: "name@company.com" (one sender),
  * "company.com" (everyone there) and "name@company.com :: subject key"
@@ -118,10 +124,9 @@ export function subjectKey(subject: string): string {
  */
 export function isMuted(muted: string[], email: string, subject = ''): boolean {
   return muted.some((m) => {
-    if (m === email) return true
     const cut = m.indexOf(' :: ')
     if (cut >= 0) return email === m.slice(0, cut) && subjectKey(subject) === m.slice(cut + 4)
-    return !m.includes('@') && (email.endsWith('@' + m) || email.endsWith('.' + m))
+    return matchesEntry(m, email)
   })
 }
 
@@ -344,14 +349,24 @@ export function findWord(text: string, word: string): string {
   return re.exec(fold(text))?.[0] ?? ''
 }
 
-/** A rule word found in `text`: its family if it has one, otherwise any word starting with it. */
-function findRuleWord(text: string, word: string): string {
-  const family = familyOf(word)
-  for (const w of family ?? [word.endsWith('*') ? word : word + '*']) {
+/** The first of `words` found in `text`, as written there, or ''. */
+function firstWord(text: string, words: string[]): string {
+  for (const w of words) {
     const hit = findWord(text, w)
     if (hit) return hit
   }
   return ''
+}
+
+/** A rule word found in `text`: its family if it has one, otherwise any word starting with it. */
+function findRuleWord(text: string, word: string): string {
+  return firstWord(text, familyOf(word) ?? [word.endsWith('*') ? word : word + '*'])
+}
+
+/** What templates and word filters search: subject, sender, the whole text (or the snippet) and file names. */
+function searchText(email: Email): string {
+  return [email.subject, email.from.name, email.from.email,
+    email.text ? readableBody(email, false) : email.snippet, ...email.attachments.map((a) => a.name)].join('\n')
 }
 
 /**
@@ -376,14 +391,91 @@ export function parseRules(input: string): string[] {
  */
 export function matchRules(email: Email, rules: string[]): { pass: boolean; tags: string[] } {
   if (!rules.length) return { pass: true, tags: [] }
-  const text = [email.subject, email.from.name, email.from.email,
-    email.text ? readableBody(email, false) : email.snippet, ...email.attachments.map((a) => a.name)].join('\n')
+  const text = searchText(email)
   const tags: string[] = []
   for (const rule of rules) {
     const found = rule.split(' + ').map((w) => findRuleWord(text, w))
     if (found.every(Boolean)) tags.push(found.join(' + '))
   }
   return { pass: tags.length > 0, tags }
+}
+
+// ------------------------------------------------------------- templates --
+
+/**
+ * The words behind the templates, written as for findWord. "bill" alone is
+ * left out because it is also a name, and "premium" and "renewal" count only
+ * in phrases, because "Premium plan" and "subscription renewal" ads would
+ * otherwise read as insurance.
+ */
+export const MONEY_WORDS = [
+  'payment*', 'paid', 'invoice*', 'receipt*', 'remittance*', 'settlement*', 'factoring', 'statement*',
+  'ach', 'wire', 'wired', 'wire transfer*', 'amount due', 'balance', 'billing', 'past due', 'premium due',
+  'оплат*', 'платеж*', 'счет', 'счета', 'инвойс*', 'квитанц*',
+]
+export const INSURANCE_WORDS = [
+  'insur*', 'policy', 'policies', 'policyholder*', 'policy renewal', 'coverage', 'coi', 'certificate of insurance',
+  'certificate holder', 'endorsement*', 'underwrit*', 'premium due', 'premium notice', 'premium payment',
+  'annual premium', 'monthly premium', 'premiums', 'страхов*', 'полис*',
+]
+export const URGENT_WORDS = [
+  'past due', 'overdue', 'final notice', 'cancellation', 'cancelled', 'canceled', 'non-payment', 'nonpayment',
+  'non payment', 'lapse*', 'просроч*', 'отмен*', 'расторж*',
+]
+
+/** Footer phrases that would make every newsletter look like insurance or money mail. */
+const FOOTER_PHRASES =
+  /\b(privacy|cookies?|returns?|refund|shipping|delivery|data|usage|acceptable use|security|company|travel)\s+(policy|policies|statement|notice)\b|\bcancellation\s+polic(y|ies)\b/gi
+
+/** Someone whose emails always come through: one address, or a domain for everyone there. */
+export interface Person {
+  entry: string
+  name: string
+  note: string
+}
+
+export function personFor(people: Person[], email: string): Person | null {
+  return people.find((p) => p.entry === email) ?? people.find((p) => matchesEntry(p.entry, email)) ?? null
+}
+
+export interface Verdict {
+  /** The template, or "words" for the inbox's own words, or "none". */
+  kind: 'urgent' | 'insurance' | 'money' | 'person' | 'words' | 'none'
+  /** The card's top line; '' for none. */
+  label: string
+  /** The words in the email that chose the template, for ▾ More. */
+  tags: string[]
+}
+
+/**
+ * Sorts an email into a template, first match wins: 🔴 insurance that is past
+ * due or being cancelled (money words or not), 💰 insurance + money, 🧾 money,
+ * ⭐ one of your people. Otherwise the inbox's own `rules` decide, then none.
+ * Your people are named on any template's card.
+ */
+export function classify(email: Email, people: Person[], rules: string[]): Verdict {
+  const text = searchText(email).replace(FOOTER_PHRASES, ' ')
+  const insurance = firstWord(text, INSURANCE_WORDS)
+  const money = firstWord(text, MONEY_WORDS)
+  const urgent = insurance ? firstWord(text, URGENT_WORDS) : ''
+  const person = personFor(people, email.from.email)
+  const star = person ? '⭐ ' + (person.name || email.from.label) : ''
+  let v: Verdict
+  if (urgent) {
+    v = { kind: 'urgent', label: '🔴 Insurance' + (money ? ' payment' : '') + ' · URGENT',
+      tags: [...new Set([insurance, urgent, money].filter(Boolean))] }
+  } else if (insurance && money) {
+    v = { kind: 'insurance', label: '💰 Insurance payment', tags: [money === insurance ? money : money + ' + ' + insurance] }
+  } else if (money) {
+    v = { kind: 'money', label: '🧾 Invoice / payment', tags: [money] }
+  } else if (person) {
+    return { kind: 'person', label: star + (person.note ? ' · ' + person.note : ''), tags: [] }
+  } else {
+    const own = rules.length ? matchRules(email, rules).tags : []
+    v = own.length ? { kind: 'words', label: '🏷 ' + own.join(', '), tags: own } : { kind: 'none', label: '', tags: [] }
+  }
+  if (star && v.kind !== 'none') v.label += ' · ' + star
+  return v
 }
 
 // -------------------------------------------------------------- telegram --
@@ -426,22 +518,41 @@ export function preview(email: Email, n: number): string {
   return clip((readableBody(email, true) || email.snippet).replace(/\s+/g, ' ').trim(), n)
 }
 
+/** The inbox's name: the one Gmail has for it, else how this email addressed it. */
+export function inboxName(label: string | null, inbox: string, email: Email): string {
+  return label || parseAddressList(email.to + ',' + email.cc).find((a) => a.email === inbox)?.name || ''
+}
+
+/** "Name · address", or just the address when there is no name. */
+function who(name: string, email: string): string {
+  return name && name.toLowerCase() !== email ? esc(clip(name, 60)) + ' · ' + esc(email) : esc(email)
+}
+
 /**
- * An email card: "Sender → inbox", the subject, then `body`. The card that
- * arrives is just that; with `details` (▾ More) the time and the filter words
- * that matched come before the text. The sender links to the email in Gmail,
+ * An email card: the template line, From and To with names, the subject, then
+ * `body`. With `details` (▾ More) the time and the words that chose the
+ * template come before the text. The subject links to the email in Gmail,
  * and the reply flow reads that link back.
  */
-export function cardText(
-  o: { inbox: string; email: Email; link: string; timeZone: string; body: string; details?: boolean; tags?: string[] },
-): string {
+export function cardText(o: {
+  label: string
+  email: Email
+  inbox: { email: string; name: string }
+  link: string
+  timeZone: string
+  body: string
+  details?: boolean
+  tags?: string[]
+}): string {
   const { email } = o
   const lines = [
-    '<a href="' + esc(o.link) + '"><b>' + esc(clip(email.from.label, 80)) + '</b></a> → ' + esc(o.inbox),
-    '<b>' + esc(clip(email.subject || '(no subject)', 300)) + '</b>',
+    ...(o.label ? ['<b>' + esc(o.label) + '</b>'] : []),
+    '<b>From:</b> ' + who(email.from.name, email.from.email),
+    '<b>To:</b> ' + who(o.inbox.name, o.inbox.email),
+    '<b>Subject:</b> <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(no subject)', 300)) + '</a>',
   ]
   if (o.details) {
-    lines.push(fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(clip(o.tags.join(', '), 200)) : ''))
+    lines.push('🕐 ' + fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(clip(o.tags.join(', '), 200)) : ''))
     if (o.body) lines.push('')
   }
   if (o.body) lines.push(esc(o.body))
@@ -454,7 +565,7 @@ export interface Button {
   url?: string
 }
 
-/** Buttons for a card: "min" is the one-liner, "more" shows the preview, "full" the whole text. */
+/** Buttons for a card: "min" is the card that arrives, "more" shows the preview, "full" the whole text. */
 export function emailKeyboard(
   inboxId: number,
   id: string,

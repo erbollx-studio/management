@@ -11,9 +11,12 @@ import {
   buildReply,
   bytesToBase64url,
   cardText,
+  classify,
   emailKeyboard,
   type GmailMessage,
+  inboxName,
   isMuted,
+  personFor,
   matchRules,
   parseAddress,
   parseAddressList,
@@ -154,16 +157,30 @@ Deno.test('mute matches an address or a whole domain, not lookalikes', () => {
   assert.ok(!isMuted(muted, 'team@cloudflare.com'))
 })
 
-Deno.test('the card: sender → inbox, subject, the first lines; sender links to Gmail', () => {
+Deno.test('the card: template, From and To with names, subject linked to Gmail, the first lines', () => {
   const e = readEmail(message())
   const link = 'https://mail.google.com/mail/u/info@jolgo.app/#all/' + e.id
-  const t = cardText({ inbox: 'info@jolgo.app', email: e, link, timeZone: 'Asia/Bishkek', body: preview(e, 300) })
+  const inbox = { email: 'info@jolgo.app', name: 'Jolgo' }
+  const t = cardText({ label: '🧾 Invoice / payment', email: e, inbox, link, timeZone: 'Asia/Bishkek', body: preview(e, 300) })
   assert.equal(t, [
-    '<a href="' + link + '"><b>Heather G</b></a> → info@jolgo.app',
-    '<b>FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</b>',
+    '<b>🧾 Invoice / payment</b>',
+    '<b>From:</b> Heather G · heatherg@aladdincap.com',
+    '<b>To:</b> Jolgo · info@jolgo.app',
+    '<b>Subject:</b> <a href="' + link + '">FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</a>',
     'Hi Erbol, FTP details attached.',
   ].join('\n'))
   assert.deepEqual(refFromEntities([{ type: 'text_link', url: link }]), { inbox: 'info@jolgo.app', id: e.id })
+  // No template line and no names: just the addresses.
+  e.from = parseAddress('jerry@grtplains.com')
+  const bare = cardText({ label: '', email: e, inbox: { email: 'info@jolgo.app', name: '' }, link, timeZone: 'Asia/Bishkek', body: '' })
+  assert.deepEqual(bare.split('\n').slice(0, 2), ['<b>From:</b> jerry@grtplains.com', '<b>To:</b> info@jolgo.app'])
+})
+
+Deno.test('the inbox name: the one Gmail has, else the one the email used', () => {
+  const e = readEmail(message())
+  assert.equal(inboxName('Dan Cargo', 'info@jolgo.app', e), 'Dan Cargo')
+  assert.equal(inboxName('', 'blambert@aladdincap.com', e), 'Lambert, Bill')
+  assert.equal(inboxName(null, 'info@jolgo.app', e), '')
 })
 
 Deno.test('the first lines: quotes cut, one paragraph, clipped; the snippet when there is no text', () => {
@@ -175,16 +192,62 @@ Deno.test('the first lines: quotes cut, one paragraph, clipped; the snippet when
   assert.equal(preview(empty, 300), 'Your invoice & receipt')
 })
 
-Deno.test('▾ More adds time, matched words and the text, all escaped', () => {
+Deno.test('▾ More adds time, the words that chose the template and the text, all escaped', () => {
   const e = readEmail(message())
   const t = cardText({
-    inbox: 'info@jolgo.app', email: e, link: 'x', timeZone: 'Asia/Bishkek', details: true, tags: ['invoice'],
-    body: readableBody(e, true),
+    label: '🧾 Invoice / payment', inbox: { email: 'info@jolgo.app', name: '' }, email: e, link: 'x',
+    timeZone: 'Asia/Bishkek', details: true, tags: ['invoice'], body: readableBody(e, true),
   })
-  const lines = t.split('\n')
-  assert.equal(lines[1], '<b>FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</b>')
-  assert.equal(lines[2], '26 Oct, 14:32 · 🏷 invoice')
-  assert.ok(t.endsWith('26 Oct, 14:32 · 🏷 invoice\n\nHi Erbol,\n\nFTP details attached.'), t)
+  assert.ok(t.endsWith('</a>\n🕐 26 Oct, 14:32 · 🏷 invoice\n\nHi Erbol,\n\nFTP details attached.'), t)
+})
+
+// Templates on a trucking inbox: [subject, body, sender, files, expected top line or '' = daily list].
+const PEOPLE = [
+  { entry: 'anna@truckinsure.com', name: 'Anna Lee', note: 'insurance agent' },
+  { entry: 'aladdincap.com', name: '', note: '' },
+]
+const templateCases: [string, string, string, string[], string][] = [
+  ['Final notice: policy #A-4411 past due', 'Your premium of $1,850 was due Oct 30.', 'billing@progressive.com', [],
+    '🔴 Insurance payment · URGENT'],
+  ['Notice of cancellation', 'Your insurance coverage ends on Nov 10.', 'notices@progressive.com', [], '🔴 Insurance · URGENT'],
+  ['Premium invoice for policy #4411', 'Please see attached.', 'billing@progressive.com', [], '💰 Insurance payment'],
+  ['Оплата страховки за октябрь', 'Счёт во вложении', 'buh@company.kg', [], '💰 Insurance payment'],
+  ['Docs', 'see attached', 'jerry@grtplains.com', ['COI_Invoice_4411.pdf'], '💰 Insurance payment'],
+  ['Remittance for load #88213', 'Payment of $2,450 was sent by ACH today.', 'ar@broker.com', [], '🧾 Invoice / payment'],
+  ['Your receipt from Anthropic', 'Receipt #2117. Read our privacy policy.', 'invoice@mail.anthropic.com', [],
+    '🧾 Invoice / payment'],
+  ['Your Premium plan invoice', 'Thanks for upgrading. See our refund policy.', 'billing@saas.io', [], '🧾 Invoice / payment'],
+  ['Quick question about the new truck', 'Can you send me the VIN?', 'anna@truckinsure.com', [],
+    '⭐ Anna Lee · insurance agent'],
+  ['Policy renewal quote', 'Attached is your quote.', 'anna@truckinsure.com', [], '⭐ Anna Lee · insurance agent'],
+  ['Invoice 991', 'Due Friday.', 'anna@truckinsure.com', [], '🧾 Invoice / payment · ⭐ Anna Lee'],
+  ['Can you call me?', 'About the load.', 'Heather G <heatherg@aladdincap.com>', [], '⭐ Heather G'],
+  ['Booking confirmed', 'Free cancellation. See our cancellation policy and privacy policy.', 'hotel@booking.com', [], ''],
+  ['Lunch tomorrow?', 'Are you free at 1?', 'friend@gmail.com', [], ''],
+]
+
+for (const [subject, body, sender, files, expected] of templateCases) {
+  Deno.test(`template: "${subject}" → ${expected || 'daily list'}`, () => {
+    const e = readEmail(message())
+    e.subject = subject
+    e.text = body
+    e.from = parseAddress(sender)
+    e.attachments = files.map((name) => ({ name, mimeType: 'application/pdf', size: 1 }))
+    const v = classify(e, PEOPLE, [])
+    assert.equal(v.label, expected, JSON.stringify(v))
+    assert.equal(v.kind === 'none', expected === '')
+  })
+}
+
+Deno.test('template: the inbox\'s own words come after the templates', () => {
+  const e = readEmail(message())
+  e.subject = 'Can you call me?'
+  e.text = 'Hi Erbol, quick question.'
+  e.from = parseAddress('jerry@grtplains.com')
+  assert.deepEqual(classify(e, [], ['erbol']), { kind: 'words', label: '🏷 erbol', tags: ['erbol'] })
+  assert.equal(classify(e, [], []).kind, 'none')
+  assert.equal(personFor(PEOPLE, 'x@mail.aladdincap.com')?.entry, 'aladdincap.com')
+  assert.equal(personFor(PEOPLE, 'x@notaladdincap.com'), null)
 })
 
 Deno.test('a reply target needs exactly one email link', () => {
