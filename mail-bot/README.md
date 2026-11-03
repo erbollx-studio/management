@@ -82,7 +82,8 @@ The subject links to the email in Gmail. The inbox name comes from Gmail.
 - **⏰** brings it back later: in 1 hour, tonight at 19:00 (offered before
   18:00) or tomorrow at 9:00. The card leaves the chat and comes back marked
   `⏰ Reminder`. Reminders live in `mailbot_reminders` and are sent by the
-  once-a-minute run, right after the mail check.
+  once-a-minute run, right after the mail check. ⏰ also cancels the
+  "⏳ No reply yet" check for that email.
 - **🗄 Archive** archives it in Gmail and removes it from the chat.
 - **🗑 Delete** removes it from the chat and marks it read in Gmail. The email
   stays in Gmail.
@@ -108,6 +109,17 @@ message: "cancelled on Nov 10", "Due Date: 11/30/2026", "send it by 11/7".
 Past dates ("was due Oct 30"), "due to…", and dates more than a year away
 don't count. Numbers are read the US way: 11/7 is 7 November. Only emails
 that come to the chat are read for dates (`findDeadline` in `mail.ts`).
+✕ Wrong date and ✓ Done stop the dates for the whole conversation (a row
+with note `off` in `mailbot_reminders`).
+
+**⏳ Nobody answered.** For a ⭐ or 📌 email, the bot checks back after 4
+working hours (8:00–20:00 Bishkek, every day). If nobody in that inbox sent a
+reply in the Gmail conversation, and the email is still in the inbox, the card
+comes back once, marked `⏳ No reply yet`, with its usual buttons. A reply from
+the chat (↩ Reply) or from Gmail itself counts, whoever in the company sent it.
+No check for noreply@, notifications@ and similar senders, or for your own
+emails. 🗄 Archive and ⏰ cancel the check; 🗑 doesn't (it only clears the
+chat). When several come back at once, only the first one rings.
 
 **Quiet hours** (`/quiet`, 22:00–7:00 at first): cards still arrive, but
 without sound or vibration. Only 🔴 urgent insurance rings. `/quiet 23-6`
