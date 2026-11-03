@@ -682,6 +682,153 @@ export function fmtWhen(due: Date, now: Date, tz: string): string {
   return fmtDate(due, tz)
 }
 
+// -------------------------------------------------------------- deadlines --
+
+/** A date without a time: year, month (1-12), day. */
+export interface Day {
+  y: number
+  m: number
+  d: number
+}
+
+const DAY_MS = 86_400_000
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const MONTH =
+  '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?'
+
+/** "Nov 10", "November 10th, 2026", "10 Nov", "11/10", "11/10/26", "2026-11-10". Numbers are US order: month first. */
+const DATE = new RegExp([
+  '\\b' + MONTH + '\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b(?:,?\\s+(\\d{4})\\b)?',
+  '\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?' + MONTH + '(?:,?\\s+(\\d{4})\\b)?',
+  '(?<![\\d/.-])(\\d{1,2})/(\\d{1,2})(?:/(\\d{4}|\\d{2}))?(?![\\d/])',
+  '(?<![\\d-])(\\d{4})-(\\d{2})-(\\d{2})(?![\\d-])',
+].join('|'), 'gi')
+
+/** Words that make a date after them, in the same sentence, a deadline. "Due to" is not one. */
+const DUE_WORDS = /\b(?:due(?!\s+to\b)|overdue|deadline|expir\w*|cancel\w*|renew\w*|laps\w*|terminat\w*)\b/i
+/** Words that do only right before the date: "send it by 11/7". */
+const DUE_RIGHT_BEFORE = /\b(?:by|before|until|till|no later than)[\s:]*(?:the\s+)?$/i
+
+function dayOf(m: RegExpMatchArray, thisYear: number, today: number): Day | null {
+  const month = (s: string) => MONTHS.indexOf(s.slice(0, 3).toLowerCase()) + 1
+  let mon: number, d: number, y: string | undefined
+  if (m[1]) [mon, d, y] = [month(m[1]), +m[2], m[3]]
+  else if (m[5]) [mon, d, y] = [month(m[5]), +m[4], m[6]]
+  else if (m[7]) [mon, d, y] = [+m[7], +m[8], m[9]]
+  else [mon, d, y] = [+m[11], +m[12], m[10]]
+  let year = y ? (y.length === 2 ? 2000 + +y : +y) : thisYear
+  // No year: this year's, or next year's when this year's passed more than two months ago.
+  if (!y && Date.UTC(year, mon - 1, d) < today - 60 * DAY_MS) year++
+  const check = new Date(Date.UTC(year, mon - 1, d))
+  if (mon < 1 || mon > 12 || check.getUTCMonth() !== mon - 1 || check.getUTCDate() !== d) return null
+  return { y: year, m: mon, d }
+}
+
+/**
+ * The soonest due date in an email: a date, today or within a year, after a
+ * due word in the same sentence (due, deadline, expires, cancelled, renewal,
+ * lapse…) or right after "by / before / until". Only the subject and the
+ * newest message count, without old replies and the signature. Past dates
+ * ("was due Oct 30") don't count.
+ */
+export function findDeadline(email: Email, now: Date, tz: string): Day | null {
+  const text = email.subject + '\n' + opening(email, 1500)
+  const t = localParts(now, tz)
+  const today = Date.UTC(t.y, t.m - 1, t.d)
+  let best: Day | null = null
+  let bestTime = Infinity
+  let prevEnd = 0
+  for (const m of text.matchAll(DATE)) {
+    const start = m.index!
+    // What comes before the date, back to the last date, the line start or the sentence start.
+    let before = text.slice(Math.max(prevEnd, start - 60), start)
+    prevEnd = start + m[0].length
+    const ends = [before.lastIndexOf('\n'), ...[...before.matchAll(/[.!?](?=\s)/g)].map((x) => x.index!)]
+    before = before.slice(Math.max(...ends) + 1)
+    if (!DUE_WORDS.test(before) && !DUE_RIGHT_BEFORE.test(before)) continue
+    const day = dayOf(m, t.y, today)
+    if (!day) continue
+    const time = Date.UTC(day.y, day.m - 1, day.d)
+    if (time < today || time > today + 366 * DAY_MS || time >= bestTime) continue
+    best = day
+    bestTime = time
+  }
+  return best
+}
+
+/** Days from today in `tz` to `day`: 0 today, 1 tomorrow. */
+function daysUntil(day: Day, now: Date, tz: string): number {
+  const t = localParts(now, tz)
+  return Math.round((Date.UTC(day.y, day.m - 1, day.d) - Date.UTC(t.y, t.m - 1, t.d)) / DAY_MS)
+}
+
+/** "2026-11-10", kept with a deadline reminder. */
+export function dayKey(day: Day): string {
+  return day.y + '-' + String(day.m).padStart(2, '0') + '-' + String(day.d).padStart(2, '0')
+}
+
+/** The card line: "📅 Due Tue 10 Nov (in 7 days)". */
+export function dueLine(day: Day, now: Date, tz: string): string {
+  const n = daysUntil(day, now, tz)
+  const when = n === 0 ? 'today' : n === 1 ? 'tomorrow' : n < 0 ? 'passed' : 'in ' + n + ' days'
+  const date = new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' })
+    .format(new Date(Date.UTC(day.y, day.m - 1, day.d)))
+  return '📅 Due ' + date.replace(',', '') + ' (' + when + ')'
+}
+
+/** When a deadline reminds you: 3 days before and on the day, at 9:00 in `tz`; only the times still ahead. */
+export function deadlineTimes(day: Day, now: Date, tz: string): Date[] {
+  return [atLocal(tz, day.y, day.m, day.d - 3, 9), atLocal(tz, day.y, day.m, day.d, 9)].filter((t) => t > now)
+}
+
+/** A Google Calendar "new event" link: an all-day event on the due day. */
+export function calendarLink(day: Day, title: string, details: string): string {
+  const start = Date.UTC(day.y, day.m - 1, day.d)
+  const ymd = (t: number) => new Date(t).toISOString().slice(0, 10).replace(/-/g, '')
+  return 'https://calendar.google.com/calendar/render?' + new URLSearchParams({
+    action: 'TEMPLATE',
+    text: 'Due: ' + title,
+    dates: ymd(start) + '/' + ymd(start + DAY_MS),
+    details,
+  })
+}
+
+// -------------------------------------------------------- nobody answered --
+
+/**
+ * `hours` of working time after `start`: only 8:00-20:00 in `tz` count, every
+ * day of the week. An email at 18:00 plus 4 hours is 10:00 the next morning.
+ */
+export function addWorkingHours(start: Date, hours: number, tz: string, from = 8, to = 20): Date {
+  let left = hours * 3_600_000
+  let t = start.getTime()
+  for (let i = 0; i < 400 && left > 0; i++) {
+    const p = localParts(new Date(t), tz)
+    const open = atLocal(tz, p.y, p.m, p.d, from).getTime()
+    const close = atLocal(tz, p.y, p.m, p.d, to).getTime()
+    if (t >= close) {
+      t = atLocal(tz, p.y, p.m, p.d + 1, from).getTime()
+      continue
+    }
+    if (t < open) t = open
+    const step = Math.min(left, close - t)
+    t += step
+    left -= step
+  }
+  return new Date(t)
+}
+
+/** noreply@, do-not-reply@, notifications@, mailer-daemon@…: nobody waits for an answer. */
+export function isNoReply(address: string): boolean {
+  return /^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|notifications?|mailer-daemon|postmaster|bounces?)(?![a-z])/i
+    .test(address.split('@')[0] ?? '')
+}
+
+/** Whether the conversation (a Gmail thread, format=minimal) has a sent message after `since` (ms). */
+export function answeredAfter(thread: { messages?: { labelIds?: string[]; internalDate?: string }[] }, since: number): boolean {
+  return (thread.messages ?? []).some((m) => (m.labelIds ?? []).includes('SENT') && Number(m.internalDate) > since)
+}
+
 // -------------------------------------------------------------- telegram --
 
 export function esc(s: string): string {
@@ -747,6 +894,8 @@ export function cardText(o: {
   body: string
   details?: boolean
   tags?: string[]
+  /** The 📅 line ("📅 Due Tue 10 Nov (in 7 days)"), right under the subject. */
+  due?: string
 }): string {
   const { email } = o
   const lines = [
@@ -754,6 +903,7 @@ export function cardText(o: {
     '<b>From:</b> ' + who(email.from.name, email.from.email),
     '<b>To:</b> ' + who(o.inbox.name, o.inbox.email),
     '<b>Subject:</b> <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(no subject)', 300)) + '</a>',
+    ...(o.due ? [esc(o.due)] : []),
   ]
   if (o.details) {
     lines.push('🕐 ' + fmtDate(email.date, o.timeZone) + (o.tags?.length ? ' · 🏷 ' + esc(clip(o.tags.join(', '), 200)) : ''))
@@ -773,6 +923,7 @@ export interface Button {
  * Buttons for a card: "min" is the card that arrives, "more" shows the
  * preview, "full" the whole text. `ask` (a money-list entry) puts ✓ Allow /
  * ✕ Not money on top, for a money email from a sender with no answer yet.
+ * `deadline` adds 📅 Add to Calendar and ✕ Wrong date (✓ Done on a reminder).
  */
 export function emailKeyboard(
   inboxId: number,
@@ -781,10 +932,17 @@ export function emailKeyboard(
   view: 'min' | 'more' | 'full',
   files = 0,
   ask = '',
+  deadline?: { url: string; done: boolean },
 ): { inline_keyboard: Button[][] } {
   const ref = inboxId + ':' + id
   const asking: Button[][] = ask
     ? [[{ text: '✓ Allow ' + clip(ask, 28), callback_data: 'G:' + ref }, { text: '✕ Not money', callback_data: 'B:' + ref }]]
+    : []
+  const due: Button[][] = deadline
+    ? [[
+      { text: '📅 Add to Calendar', url: deadline.url },
+      { text: deadline.done ? '✓ Done' : '✕ Wrong date', callback_data: 'Z:' + ref },
+    ]]
     : []
   const reply: Button = { text: '↩ Reply', callback_data: 'R:' + ref }
   const later: Button = { text: '⏰', callback_data: 'T:' + ref }
@@ -793,13 +951,13 @@ export function emailKeyboard(
     { text: '🔕', callback_data: 's:' + ref },
   ]
   if (view === 'min') {
-    return { inline_keyboard: [...asking, [{ text: '▾ More', callback_data: 'v:' + ref }, reply, later, ...done]] }
+    return { inline_keyboard: [...asking, ...due, [{ text: '▾ More', callback_data: 'v:' + ref }, reply, later, ...done]] }
   }
   const top: Button[] = [{ text: '▴ Less', callback_data: 'c:' + ref }]
   if (view === 'more') top.push({ text: '📄 Full text', callback_data: 'f:' + ref })
   if (files) top.push({ text: '📎 ' + files, callback_data: 'p:' + ref })
   top.push({ text: '↗ Gmail', url: link })
-  return { inline_keyboard: [...asking, top, [reply, later, { text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
+  return { inline_keyboard: [...asking, top, ...due, [reply, later, { text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
 }
 
 /** The ⏰ choices for a card. "Tonight" is offered only before 18:00. */
