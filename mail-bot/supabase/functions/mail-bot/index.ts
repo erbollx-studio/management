@@ -3,14 +3,19 @@ import { createClient } from 'jsr:@supabase/supabase-js@2'
 import {
   base64urlToBytes,
   buildReply,
+  calendarLink,
   cardText,
   clip,
+  dayKey,
+  deadlineTimes,
   decide,
   decodeEntities,
   describeMute,
+  dueLine,
   type Email,
   emailKeyboard,
   esc,
+  findDeadline,
   fmtDate,
   fmtWhen,
   gmailLink,
@@ -695,19 +700,31 @@ interface Card {
 /**
  * A card's text and buttons. A money email from a sender with no answer yet
  * carries ✓ Allow / ✕ Not money. `prefix` leads the top line ("⏰ Reminder").
+ * `due` adds the 📅 line and its buttons; `done` (a 📅 reminder) offers ✓ Done
+ * there instead of ✕ Wrong date.
  */
-function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View, prefix = ''): Card {
+function renderCard(
+  ib: Inbox,
+  email: Email,
+  ctx: Ctx,
+  view: View,
+  prefix = '',
+  due: Day | null = null,
+  done = false,
+): Card {
   const d = decide(email, ctx.people, ib.keywords, ctx.senders)
   const isTagged = Boolean(ib.tag_label_id) && email.labelIds.includes(ib.tag_label_id!)
   const label = [prefix, isTagged ? '📌 ' + ctx.tag : '', d.label, d.asking ? '🆕 new sender' : '']
     .filter(Boolean).join(' · ')
   const link = gmailLink(ib.email, email.id)
+  // In `base`, so all three views show the 📅 line.
   const base = {
     label,
     email,
     inbox: { email: ib.email, name: inboxName(ib.label, ib.email, email) },
     link,
     timeZone: ctx.tz,
+    due: due ? dueLine(due, new Date(), ctx.tz) : undefined,
   }
   let text
   if (view === 'min') text = cardText({ ...base, body: preview(email, CARD_CHARS) })
@@ -719,9 +736,10 @@ function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View, prefix = ''):
     text = cardText({ ...base, details: true, tags: d.tags, body })
   }
   const files = Math.min(email.attachments.length, MAX_ATTACHMENTS)
+  const deadline = due ? { url: calendarLink(due, clip(email.subject || '(no subject)', 100), link), done } : undefined
   return {
     text,
-    markup: emailKeyboard(ib.id, email.id, link, view, files, d.asking ? d.sender : ''),
+    markup: emailKeyboard(ib.id, email.id, link, view, files, d.asking ? d.sender : '', deadline),
     urgent: d.kind === 'urgent',
   }
 }
@@ -740,8 +758,14 @@ async function postCard(
   prefix = '',
   opts: { quiet?: boolean; done?: boolean } = {},
 ): Promise<Day | null> {
-  const due: Day | null = null
-  const card = renderCard(ib, email, ctx, view, prefix)
+  // A deadline problem never stops the card: it just comes without the 📅 line.
+  let due: Day | null = null
+  try {
+    due = await deadlineOf(ib, email, ctx)
+  } catch (e) {
+    console.error('deadline', ib.email, email.id, e)
+  }
+  const card = renderCard(ib, email, ctx, view, prefix, due, opts.done ?? false)
   const silent = opts.quiet || (!card.urgent && isQuiet(new Date(), ctx.tz, ctx.quiet))
   const res = await send(chat, card.text, card.markup, undefined, silent)
   if (!res.ok) throw new TelegramError(res)
@@ -751,7 +775,7 @@ async function postCard(
 // deno-lint-ignore no-explicit-any
 async function showCard(q: any, ib: Inbox, id: string, view: View, cfg: Config): Promise<void> {
   const [email, ctx] = await Promise.all([fetchEmail(ib, id), loadCtx(cfg)])
-  const card = renderCard(ib, email, ctx, view)
+  const card = renderCard(ib, email, ctx, view, '', await deadlineOf(ib, email, ctx))
   await edit(q.message.chat.id, q.message.message_id, card.text, card.markup)
 }
 
@@ -1268,7 +1292,8 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
       const email = await fetchEmail(ib, id)
       const entry = muteEntry(email, kind ?? 's')
       if (entry) await db.from('mailbot_muted').delete().eq('entry', entry)
-      const card = renderCard(ib, email, await loadCtx(cfg), 'min')
+      const ctx = await loadCtx(cfg)
+      const card = renderCard(ib, email, ctx, 'min', '', await deadlineOf(ib, email, ctx))
       await edit(chat, messageId, card.text, card.markup)
       return 'Back on'
     }
@@ -1282,7 +1307,8 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
         await remove(chat, messageId)
         return entry + ': money emails go to the daily list. /senders to change it.'
       }
-      const card = renderCard(ib, email, await loadCtx(cfg), 'min')
+      const ctx = await loadCtx(cfg)
+      const card = renderCard(ib, email, ctx, 'min', '', await deadlineOf(ib, email, ctx))
       await edit(chat, messageId, card.text, card.markup)
       return '✓ ' + entry + ' allowed: their money emails come here now.'
     }
@@ -1328,21 +1354,65 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
 
 // -------------------------------------------------------------- deadlines --
 
+/**
+ * The email's 📅 due date, or null when it has none or you stopped its
+ * reminders (✕ Wrong date / ✓ Done leave an "off" row for the conversation).
+ * If that row can't be checked, the date still shows: better than no card.
+ */
+async function deadlineOf(ib: Inbox, email: Email, ctx: Ctx): Promise<Day | null> {
+  const day = findDeadline(email, new Date(), ctx.tz)
+  if (!day) return null
+  const { data, error } = await db.from('mailbot_reminders').select('id').eq('kind', 'deadline').eq('inbox_id', ib.id)
+    .eq('thread_id', email.threadId).eq('note', 'off').limit(1)
+  if (error) {
+    console.error('deadline off check', ib.email, email.id, error.message)
+    return day
+  }
+  return data?.length ? null : day
+}
+
 /** Saves the 📅 reminders for a new email's due date: 3 days before and on the day, at 9:00. */
-async function scheduleDeadline(_ib: Inbox, _email: Email, _day: Day, _tz: string): Promise<void> {
-  // TODO(deadlines)
+async function scheduleDeadline(ib: Inbox, email: Email, day: Day, tz: string): Promise<void> {
+  // One row at a time, so a time that is already saved doesn't stop the other one.
+  for (const t of deadlineTimes(day, new Date(), tz)) {
+    const { error } = await db.from('mailbot_reminders').insert({
+      kind: 'deadline',
+      inbox_id: ib.id,
+      message_id: email.id,
+      thread_id: email.threadId,
+      due_at: t.toISOString(),
+      note: dayKey(day),
+    })
+    // 23505: this conversation already has a reminder at that time (an earlier email in it said the same date).
+    if (error && error.code !== '23505') console.error('deadline reminder', ib.email, email.id, error.message)
+  }
 }
 
 /** A 📅 reminder that is due: the card comes back marked "📅 Reminder", with ✓ Done. */
-async function sendDeadline(_ib: Inbox, _r: Reminder, _chat: string, _ctx: Ctx): Promise<void> {
-  // TODO(deadlines)
+async function sendDeadline(ib: Inbox, r: Reminder, chat: string, ctx: Ctx): Promise<void> {
+  await postCard(ib, await fetchEmail(ib, r.message_id), chat, ctx, 'min', '📅 Reminder', { done: true })
 }
 
 /** ✕ Wrong date / ✓ Done: no more 📅 reminders for this conversation, and the card loses its 📅 line. */
 // deno-lint-ignore no-explicit-any
-async function stopDeadline(_q: any, _ib: Inbox, _id: string, _cfg: Config): Promise<string> {
-  // TODO(deadlines)
-  return await Promise.resolve('')
+async function stopDeadline(q: any, ib: Inbox, id: string, cfg: Config): Promise<string> {
+  const { threadId } = await gmail(ib, `messages/${id}?format=minimal`)
+  const { error: gone } = await db.from('mailbot_reminders').delete().eq('kind', 'deadline').eq('inbox_id', ib.id)
+    .eq('thread_id', threadId)
+  if (gone) throw new Error('reminders: ' + gone.message)
+  // The "off" row keeps new emails in this conversation from bringing the date back.
+  // Its time is 'infinity', so the reminder run never picks it up.
+  const { error } = await db.from('mailbot_reminders').insert({
+    kind: 'deadline',
+    inbox_id: ib.id,
+    message_id: id,
+    thread_id: threadId,
+    due_at: 'infinity',
+    note: 'off',
+  })
+  if (error && error.code !== '23505') throw new Error('reminders: ' + error.message)
+  await showCard(q, ib, id, 'min', cfg)
+  return 'No more reminders for this date.'
 }
 
 // -------------------------------------------------------------- reminders --
