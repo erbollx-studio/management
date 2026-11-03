@@ -27,6 +27,20 @@ contact lines ("INVOICES / BILLING: ap@broker.com"), footers and phrases like
 payment and insurance words in all of those places, so searching the whole
 email sent nearly every one of them to the chat.
 
+## The tag: 📌 erbol
+
+Put the Gmail label **erbol** on any email, in any connected inbox, and it
+comes to the chat within a minute, whatever the templates, filters and 🔕
+say. The card starts with `📌 erbol`. The bot makes the label in each inbox
+the first time, so it is already in Gmail's label menu; anyone who works in
+that inbox (a dispatcher, an accountant) can tag an email for you.
+
+- Tagging a whole conversation sends only its newest message.
+- A Gmail filter that puts the label on (for example "from: my accountant →
+  label erbol") works too: those emails arrive tagged and come straight here.
+- Each email comes once per tag. Spam and the bin are left out.
+- A different name: set `tag_label` in `mailbot_config`.
+
 Emails that fit no template go to the daily list, not the chat. Per inbox,
 `/filter` can add extra words that also let emails through, or switch the inbox
 to all emails.

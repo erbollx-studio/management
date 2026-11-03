@@ -233,6 +233,41 @@ export function readEmail(msg: GmailMessage): Email {
   }
 }
 
+interface HistoryMessage {
+  id: string
+  threadId?: string
+  labelIds?: string[]
+}
+
+export interface HistoryRecord {
+  messagesAdded?: { message: HistoryMessage }[]
+  labelsAdded?: { message: HistoryMessage; labelIds?: string[] }[]
+}
+
+/**
+ * The emails that got the label `tagId` in these Gmail history records: put on
+ * by hand (labelsAdded) or there when the email arrived, e.g. by a Gmail
+ * filter (messagesAdded). Tagging a conversation in Gmail tags every message
+ * in it, so each conversation gives only its newest message (Gmail ids grow
+ * with time).
+ */
+export function taggedIds(records: HistoryRecord[], tagId: string): string[] {
+  const newest = new Map<string, string>()
+  for (const h of records) {
+    const hits = [
+      ...(h.messagesAdded ?? []).filter((a) => a.message.labelIds?.includes(tagId)),
+      ...(h.labelsAdded ?? []).filter((a) => a.labelIds?.includes(tagId)),
+    ]
+    for (const { message: m } of hits) {
+      const thread = m.threadId ?? m.id
+      const seen = newest.get(thread)
+      // Hex ids: longer is newer, and at equal length the text order is the number order.
+      if (!seen || m.id.length > seen.length || (m.id.length === seen.length && m.id > seen)) newest.set(thread, m.id)
+    }
+  }
+  return [...newest.values()]
+}
+
 /** Mail that isn't in the inbox (sent, drafts, spam, filtered away) or sits in a skipped tab. */
 export function shouldSkip(labelIds: string[], skipCategories: string[]): boolean {
   if (!labelIds.includes('INBOX')) return true

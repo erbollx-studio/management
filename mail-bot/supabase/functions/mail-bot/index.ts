@@ -27,9 +27,11 @@ import {
   shouldSkip,
   similarWords,
   stopKeyboard,
+  taggedIds,
   URGENT_WORDS,
   type Attachment,
   type Button,
+  type HistoryRecord,
 } from './mail.ts'
 
 /**
@@ -38,9 +40,10 @@ import {
  * insurance, 💰 insurance payment, 🧾 invoice / payment, ⭐ your people) and
  * arrives as a short card: the template, From and To, the subject, the first
  * lines. Emails that fit no template go to the daily list instead, unless the
- * inbox is set to all emails. ▾ More shows the rest, 🗑 removes it from the
- * chat, 🔕 stops emails like it. Each inbox connects with Google sign-in;
- * nothing is forwarded anywhere.
+ * inbox is set to all emails. An email you put the Gmail label "erbol" on
+ * (the tag) always comes, whatever the filters. ▾ More shows the rest, 🗑
+ * removes it from the chat, 🔕 stops emails like it. Each inbox connects with
+ * Google sign-in; nothing is forwarded anywhere.
  *
  * Routes. verify_jwt is off because Telegram and Google call in without a
  * Supabase JWT, so every route checks its own secret:
@@ -82,6 +85,8 @@ const EXPIRY_MARGIN_MS = 60_000
 const DEFAULT_TIME_ZONE = 'Asia/Bishkek'
 const FILTER_WAIT_MS = 10 * 60_000
 const DIGEST_ITEMS = 20
+const DEFAULT_TAG = 'erbol'
+const TAG_RECHECK_MS = 60 * 60_000
 
 /** A 🗑 button for messages that are not email cards (files, lists, confirmations). */
 const TRASH = { inline_keyboard: [[{ text: '🗑', callback_data: 'X' }]] }
@@ -94,6 +99,7 @@ const HELP = [
   '/unread: latest unread emails',
   '/templates: what 🔴 💰 🧾 ⭐ look for',
   '/people: your ⭐ people, their emails always come through',
+  '📌 Put the Gmail label "erbol" on any email and it comes here, whatever the filters.',
   '/filter: per inbox: templates only, extra words, or all emails',
   '/skipped: emails that fit no template (the daily list)',
   '/muted: what you stopped with 🔕, tap to undo',
@@ -122,6 +128,9 @@ interface Inbox {
   keywords: string[]
   /** templates: only template emails and the inbox's own words come through. all: every email does. */
   mode: 'templates' | 'all'
+  /** The Gmail label id of the tag ("erbol") in this inbox, and when it was last looked up. */
+  tag_label_id: string | null
+  tag_checked_at: string | null
 }
 
 /** What sorting emails and drawing cards needs besides the email itself. */
@@ -129,6 +138,8 @@ interface Ctx {
   tz: string
   muted: string[]
   people: Person[]
+  /** The Gmail label name that sends an email here whatever the filters. */
+  tag: string
 }
 
 // ---------------------------------------------------------------- helpers --
@@ -198,7 +209,12 @@ async function loadCtx(cfg: Config): Promise<Ctx> {
     loadMuted(),
     db.from('mailbot_people').select('entry, name, note'),
   ])
-  return { tz: cfg.time_zone || DEFAULT_TIME_ZONE, muted, people: (people ?? []) as Person[] }
+  return {
+    tz: cfg.time_zone || DEFAULT_TIME_ZONE,
+    muted,
+    people: (people ?? []) as Person[],
+    tag: cfg.tag_label || DEFAULT_TAG,
+  }
 }
 
 async function connectedInboxes(): Promise<Inbox[]> {
@@ -410,9 +426,27 @@ async function pollAll(cfg: Config): Promise<number> {
   return counts.reduce((a, b) => a + b, 0)
 }
 
+/** Every Gmail history record of `types` since the inbox's cursor for messages with `labelId`, all pages. */
+async function historySince(ib: Inbox, chat: string, labelId: string, types: string[]) {
+  const records: HistoryRecord[] = []
+  let latest = ib.history_id!
+  let pageToken = ''
+  do {
+    const q = new URLSearchParams({ startHistoryId: ib.history_id!, labelId })
+    for (const t of types) q.append('historyTypes', t)
+    if (pageToken) q.set('pageToken', pageToken)
+    const body = await gmail(ib, 'history?' + q, undefined, chat)
+    records.push(...(body.history ?? []))
+    if (body.historyId) latest = String(body.historyId)
+    pageToken = body.nextPageToken ?? ''
+  } while (pageToken)
+  return { records, latest }
+}
+
 /**
- * Posts what arrived since the inbox's history cursor. Gmail's history API
- * lists only additions, so a quiet inbox costs one small call a minute.
+ * Posts what arrived since the inbox's history cursor, and every email that
+ * got the tag label since then. Gmail's history API lists only changes, so a
+ * quiet inbox costs two small calls a minute.
  */
 async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
   const now = new Date().toISOString()
@@ -424,55 +458,54 @@ async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
     return 0
   }
 
+  const tagId = await tagLabelId(ib, ctx.tag)
+  let arrived, tagging
+  try {
+    arrived = await historySince(ib, chat, 'INBOX', ['messageAdded'])
+    tagging = tagId ? await historySince(ib, chat, tagId, ['messageAdded', 'labelAdded']) : arrived
+  } catch (e) {
+    // 404: the cursor aged out (Gmail keeps about a week). Start again from now.
+    if (e instanceof GmailError && e.status === 404) {
+      ib.history_id = null
+      return await pollInbox(ib, chat, ctx)
+    }
+    throw e
+  }
+  const tagged = tagId ? taggedIds(tagging.records, tagId) : []
   const ids: string[] = []
-  let latest = ib.history_id
-  let pageToken = ''
-  do {
-    const q = new URLSearchParams({ startHistoryId: ib.history_id, historyTypes: 'messageAdded', labelId: 'INBOX' })
-    if (pageToken) q.set('pageToken', pageToken)
-    let body
-    try {
-      body = await gmail(ib, 'history?' + q, undefined, chat)
-    } catch (e) {
-      // 404: the cursor aged out (Gmail keeps about a week). Start again from now.
-      if (e instanceof GmailError && e.status === 404) {
-        ib.history_id = null
-        return await pollInbox(ib, chat, ctx)
-      }
-      throw e
+  for (const h of arrived.records) {
+    for (const added of h.messagesAdded ?? []) {
+      const m = added.message
+      if (!shouldSkip(m.labelIds ?? [], SKIP_CATEGORIES) && !ids.includes(m.id) && !tagged.includes(m.id)) ids.push(m.id)
     }
-    for (const h of body.history ?? []) {
-      for (const added of h.messagesAdded ?? []) {
-        const m = added.message
-        if (!shouldSkip(m.labelIds ?? [], SKIP_CATEGORIES) && !ids.includes(m.id)) ids.push(m.id)
-      }
-    }
-    if (body.historyId) latest = String(body.historyId)
-    pageToken = body.nextPageToken ?? ''
-  } while (pageToken)
+  }
+  const latest = BigInt(arrived.latest) > BigInt(tagging.latest) ? arrived.latest : tagging.latest
 
-  const batch = ids.slice(0, MAX_EMAILS_PER_RUN)
+  // Tagged emails first. Their claim is "tag:<id>", so an email already posted
+  // (or held back) when it arrived still comes once more when it gets the tag.
+  const jobs = [...tagged.map((id) => ({ id, tagged: true })), ...ids.map((id) => ({ id, tagged: false }))]
+  const batch = jobs.slice(0, MAX_EMAILS_PER_RUN).map((j) => ({ ...j, key: (j.tagged ? 'tag:' : '') + j.id }))
   let posted = 0
   let retry = false
   if (batch.length) {
     // Claim before posting, so overlapping runs never post the same email twice.
     const { data: claimed } = await db.from('mailbot_seen')
-      .upsert(batch.map((id) => ({ inbox_id: ib.id, message_id: id })), {
+      .upsert(batch.map((j) => ({ inbox_id: ib.id, message_id: j.key })), {
         onConflict: 'inbox_id,message_id',
         ignoreDuplicates: true,
       })
       .select('message_id')
     const mine = new Set((claimed ?? []).map((r) => r.message_id))
-    for (const id of batch) {
-      if (!mine.has(id)) continue
+    for (const job of batch) {
+      if (!mine.has(job.key)) continue
       try {
-        if (await deliver(ib, id, chat, ctx)) posted++
+        if (await deliver(ib, job.id, chat, ctx, job.tagged)) posted++
       } catch (e) {
         if (e instanceof GmailError && e.status === 404) continue // deleted before we got to it
-        console.error('deliver', ib.email, id, e)
+        console.error('deliver', ib.email, job.id, e)
         if (e instanceof TelegramError && !e.transient) continue
         retry = true
-        await db.from('mailbot_seen').delete().eq('inbox_id', ib.id).eq('message_id', id)
+        await db.from('mailbot_seen').delete().eq('inbox_id', ib.id).eq('message_id', job.key)
       }
     }
   }
@@ -480,9 +513,36 @@ async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
   // A capped or failed run keeps the cursor, so the rest comes next minute;
   // mailbot_seen skips whatever was already posted.
   const update: Record<string, unknown> = { last_checked_at: now, last_error: null }
-  if (!retry && ids.length <= batch.length) update.history_id = latest
+  if (!retry && jobs.length <= batch.length) update.history_id = latest
   await db.from('mailbot_inboxes').update(update).eq('id', ib.id)
   return posted
+}
+
+/**
+ * The id of the tag label ("erbol") in this inbox. The first time, the bot
+ * makes the label if the inbox doesn't have it, so it is in Gmail's label menu
+ * right away; after that it only looks it up, once an hour, so a deleted or
+ * renamed label isn't made again.
+ */
+async function tagLabelId(ib: Inbox, name: string): Promise<string | null> {
+  const fresh = Date.parse(ib.tag_checked_at ?? '') > Date.now() - TAG_RECHECK_MS
+  if (fresh) return ib.tag_label_id
+  let id: string | null = null
+  try {
+    const { labels } = await gmail(ib, 'labels')
+    // deno-lint-ignore no-explicit-any
+    id = (labels ?? []).find((l: any) => String(l.name).toLowerCase() === name.toLowerCase())?.id ?? null
+    if (!id && !ib.tag_checked_at) {
+      id = (await gmail(ib, 'labels', { name, labelListVisibility: 'labelShow', messageListVisibility: 'show' })).id ?? null
+    }
+  } catch (e) {
+    console.error('tag label', ib.email, e)
+    return ib.tag_label_id
+  }
+  ib.tag_label_id = id
+  ib.tag_checked_at = new Date().toISOString()
+  await db.from('mailbot_inboxes').update({ tag_label_id: id, tag_checked_at: ib.tag_checked_at }).eq('id', ib.id)
+  return id
 }
 
 /** The inbox's name for the To line, asked from Gmail once; '' when Gmail has none. */
@@ -500,8 +560,14 @@ async function rememberInboxName(ib: Inbox): Promise<void> {
   await db.from('mailbot_inboxes').update({ label: name }).eq('id', ib.id)
 }
 
-async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx): Promise<boolean> {
+async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = false): Promise<boolean> {
   const email = readEmail(await gmail(ib, `messages/${id}?format=full`, undefined, chat))
+  if (tagged) {
+    // The tag is a request: it beats templates, filters and 🔕. Only spam and the bin stay out.
+    if (email.labelIds.some((l) => l === 'SPAM' || l === 'TRASH')) return false
+    await postCard(ib, email, chat, ctx, 'min')
+    return true
+  }
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
   if (isMuted(ctx.muted, email.from.email, email.subject)) return false
@@ -524,8 +590,9 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx): Promise<b
 
 function cardFor(ib: Inbox, email: Email, ctx: Ctx, view: View): string {
   const { label, tags } = classify(email, ctx.people, ib.keywords)
+  const isTagged = Boolean(ib.tag_label_id) && email.labelIds.includes(ib.tag_label_id!)
   const base = {
-    label,
+    label: isTagged ? '📌 ' + ctx.tag + (label ? ' · ' + label : '') : label,
     email,
     inbox: { email: ib.email, name: inboxName(ib.label, ib.email, email) },
     link: gmailLink(ib.email, email.id),

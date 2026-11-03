@@ -27,6 +27,7 @@ import {
   preview,
   shouldSkip,
   similarWords,
+  taggedIds,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -262,6 +263,27 @@ for (const [subject, body, sender, files, expected] of templateCases) {
     assert.equal(v.kind === 'none', expected === '')
   })
 }
+
+Deno.test('tag: emails tagged by hand or by a Gmail filter, one per conversation, the newest', () => {
+  const TAG = 'Label_77'
+  const records = [
+    // Tagging a 3-message conversation in Gmail tags all three.
+    { labelsAdded: [
+      { message: { id: '18f0a1000000000a', threadId: 't1' }, labelIds: [TAG] },
+      { message: { id: '18f0a1000000000c', threadId: 't1' }, labelIds: [TAG] },
+      { message: { id: '18f0a1000000000b', threadId: 't1' }, labelIds: [TAG] },
+    ] },
+    // Starred, not tagged.
+    { labelsAdded: [{ message: { id: '18f0a1000000000d', threadId: 't2' }, labelIds: ['STARRED'] }] },
+    // Arrived with the tag on (a Gmail filter), and one that arrived without it.
+    { messagesAdded: [
+      { message: { id: '18f0a1000000000e', threadId: 't3', labelIds: ['INBOX', TAG] } },
+      { message: { id: '18f0a1000000000f', threadId: 't4', labelIds: ['INBOX'] } },
+    ] },
+  ]
+  assert.deepEqual(taggedIds(records, TAG), ['18f0a1000000000c', '18f0a1000000000e'])
+  assert.deepEqual(taggedIds([], TAG), [])
+})
 
 Deno.test('template: the inbox\'s own words come after the templates', () => {
   const e = readEmail(message())
