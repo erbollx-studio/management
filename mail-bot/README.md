@@ -53,6 +53,12 @@ the first time, so it is already in Gmail's label menu; anyone who works in
 that inbox (a dispatcher, an accountant) can tag an email for you.
 
 - Tagging a whole conversation sends only its newest message.
+- **New replies in a tagged conversation come too**, marked `📌 erbol · reply`,
+  with the "⏳ No reply yet" check. Gmail puts the label only on the emails
+  that were in the conversation when you tagged it, so the bot looks at the
+  whole conversation when a reply arrives. To stop: remove the label from the
+  conversation in Gmail, or 🔕 "Emails like this one". (Before this, on 3 Nov,
+  two replies in a tagged T-Mobile conversation went to the daily list.)
 - A Gmail filter that puts the label on (for example "from: my accountant →
   label erbol") works too: those emails arrive tagged and come straight here.
 - Each email comes once per tag. Spam and the bin are left out.

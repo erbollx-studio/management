@@ -824,6 +824,11 @@ export function isNoReply(address: string): boolean {
     .test(address.split('@')[0] ?? '')
 }
 
+/** Whether any email in a Gmail conversation (threads/{id}?format=minimal) has the label `labelId`. */
+export function threadHasLabel(thread: { messages?: { labelIds?: string[] }[] }, labelId: string): boolean {
+  return (thread.messages ?? []).some((m) => (m.labelIds ?? []).includes(labelId))
+}
+
 /** Whether the conversation (a Gmail thread, format=minimal) has a sent message after `since` (ms). */
 export function answeredAfter(thread: { messages?: { labelIds?: string[]; internalDate?: string }[] }, since: number): boolean {
   return (thread.messages ?? []).some((m) => (m.labelIds ?? []).includes('SENT') && Number(m.internalDate) > since)

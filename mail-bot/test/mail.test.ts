@@ -46,6 +46,7 @@ import {
   addWorkingHours,
   isNoReply,
   answeredAfter,
+  threadHasLabel,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -709,4 +710,20 @@ Deno.test('answered: a sent message in the conversation after the email', () => 
   assert.ok(!answeredAfter(thread([[['SENT'], 50], [['INBOX'], 100]]), 100)) // the answer was to an older email
   assert.ok(!answeredAfter(thread([[['INBOX', 'UNREAD'], 100]]), 100))
   assert.ok(!answeredAfter({}, 100))
+})
+
+Deno.test('a tagged conversation: new replies come without the tag, but the conversation has it', () => {
+  // Like the T-Mobile "Number transfer" chain on 3 Nov: tagged at 15:27, two more replies at 16:32 and 16:34.
+  const thread = {
+    messages: [
+      { labelIds: ['Label_1', 'SENT'] },
+      { labelIds: ['Label_1', 'IMPORTANT', 'INBOX'] },
+      { labelIds: ['SENT'] },
+      { labelIds: ['IMPORTANT', 'INBOX'] },
+    ],
+  }
+  assert.ok(threadHasLabel(thread, 'Label_1'))
+  assert.ok(!threadHasLabel(thread, 'Label_9'))
+  assert.ok(!threadHasLabel({ messages: [{ labelIds: ['INBOX'] }, {}] }, 'Label_1'))
+  assert.ok(!threadHasLabel({}, 'Label_1'))
 })
