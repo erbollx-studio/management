@@ -1,6 +1,8 @@
 import 'jsr:@supabase/functions-js@2/edge-runtime.d.ts'
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 import {
+  addWorkingHours,
+  answeredAfter,
   base64urlToBytes,
   buildReply,
   calendarLink,
@@ -22,6 +24,7 @@ import {
   inboxName,
   INSURANCE_WORDS,
   isMuted,
+  isNoReply,
   isQuiet,
   laterKeyboard,
   laterTime,
@@ -30,6 +33,7 @@ import {
   parseQuiet,
   parseRules,
   type Person,
+  personFor,
   preview,
   readableBody,
   readEmail,
@@ -1458,19 +1462,49 @@ async function runReminders(cfg: Config): Promise<void> {
 
 // -------------------------------------------------------- nobody answered --
 
-/** For a ⭐ or 📌 email from a real person: check in 4 working hours whether anyone answered. */
-async function scheduleUnanswered(_ib: Inbox, _email: Email, _ctx: Ctx, _tagged: boolean): Promise<void> {
-  // TODO(unanswered)
+/**
+ * For a ⭐ or 📌 email from a real person: check in 4 working hours whether anyone answered.
+ * One check per conversation, so a newer email in it replaces the old check. The clock starts
+ * now (a 📌 email may be old), but a reply counts from the email's own time, kept in `note`.
+ */
+async function scheduleUnanswered(ib: Inbox, email: Email, ctx: Ctx, tagged: boolean): Promise<void> {
+  if (!tagged && !personFor(ctx.people, email.from.email)) return
+  if (isNoReply(email.from.email) || email.from.email === ib.email) return
+  // The index on (inbox_id, thread_id) is partial, so PostgREST can't upsert on it: delete, then insert.
+  await clearUnanswered(ib.id, email.threadId)
+  const { error } = await db.from('mailbot_reminders').insert({
+    kind: 'unanswered',
+    inbox_id: ib.id,
+    message_id: email.id,
+    thread_id: email.threadId,
+    due_at: addWorkingHours(new Date(), 4, ctx.tz).toISOString(),
+    note: String(email.date.getTime()),
+  })
+  // 23505: another mail check saved one for this conversation at the same moment. One is enough.
+  if (error && error.code !== '23505') console.error('unanswered', ib.email, email.id, error.message)
 }
 
-/** A due "nobody answered" check: if no reply went out, the card comes back marked "⏳ No reply yet". */
-async function sendUnanswered(_ib: Inbox, _r: Reminder, _chat: string, _ctx: Ctx, _run: { rang: boolean }): Promise<void> {
-  // TODO(unanswered)
+/**
+ * A due "nobody answered" check: if no reply went out since the email and it is still in the
+ * inbox, the card comes back marked "⏳ No reply yet". Gmail and Telegram errors throw, so
+ * runReminders tries again.
+ */
+async function sendUnanswered(ib: Inbox, r: Reminder, chat: string, ctx: Ctx, run: { rang: boolean }): Promise<void> {
+  const thread: { messages?: { id: string; labelIds?: string[]; internalDate?: string }[] } =
+    await gmail(ib, `threads/${r.thread_id}?format=minimal`)
+  if (answeredAfter(thread, Number(r.note))) return
+  // Archived or binned in Gmail: you already dealt with it there.
+  const labels = thread.messages?.find((m) => m.id === r.message_id)?.labelIds ?? []
+  if (!labels.includes('INBOX') || labels.includes('TRASH') || labels.includes('SPAM')) return
+  await postCard(ib, await fetchEmail(ib, r.message_id), chat, ctx, 'min', '⏳ No reply yet', { quiet: run.rang })
+  run.rang = true
 }
 
-/** The conversation was archived: no "nobody answered" check for it. */
-async function clearUnanswered(_inboxId: number, _threadId: string): Promise<void> {
-  // TODO(unanswered)
+/** No "nobody answered" check for this conversation: it was archived, or a newer email starts a new one. */
+async function clearUnanswered(inboxId: number, threadId: string): Promise<void> {
+  const { error } = await db.from('mailbot_reminders').delete().eq('kind', 'unanswered').eq('inbox_id', inboxId)
+    .eq('thread_id', threadId)
+  if (error) console.error('unanswered clear', inboxId, threadId, error.message)
 }
 
 // ---------------------------------------------------------------- filters --
