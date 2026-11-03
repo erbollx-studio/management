@@ -98,6 +98,17 @@ The subject links to the email in Gmail. The inbox name comes from Gmail.
 Other bot messages (files, lists, confirmations) have a 🗑 button too, so the
 chat stays clean. Emails in the Promotions and Social tabs are skipped.
 
+**📅 Deadlines.** When an email in the chat has a due date, the card shows it:
+`📅 Due Tue 10 Nov (in 7 days)`, with **📅 Add to Calendar** and **✕ Wrong
+date**. The card comes back marked `📅 Reminder` 3 days before and on the day,
+at 9:00 (Bishkek); there **✓ Done** stops the rest. A due date is a date after
+a due word in the same sentence (due, deadline, expires, cancelled, renewal,
+lapse…) or right after "by / before / until", in the subject or the newest
+message: "cancelled on Nov 10", "Due Date: 11/30/2026", "send it by 11/7".
+Past dates ("was due Oct 30"), "due to…", and dates more than a year away
+don't count. Numbers are read the US way: 11/7 is 7 November. Only emails
+that come to the chat are read for dates (`findDeadline` in `mail.ts`).
+
 **Quiet hours** (`/quiet`, 22:00–7:00 at first): cards still arrive, but
 without sound or vibration. Only 🔴 urgent insurance rings. `/quiet 23-6`
 changes the hours, `/quiet off` turns them off.
@@ -166,6 +177,20 @@ Health check (no private data): `GET …/functions/v1/mail-bot/health`
 ```
 deno test mail-bot/test/
 ```
+
+## Never losing an email
+
+- An email is marked as handled only after it reached the chat (or the daily
+  list). If Telegram or Gmail fails, the bot keeps its place in Gmail and tries
+  that email again the next minute.
+- One check runs at a time (the `run_lock` row in `mailbot_config`). If a check
+  is still busy, the next minute's check waits its turn.
+- Telegram and Gmail calls give up after 20 to 30 seconds, and a check stops
+  taking new emails after 40 seconds; the rest come next minute.
+- Why: on 3 Nov 2026 Telegram hung for two minutes. The next check stepped past
+  an email the stuck check was holding, then the stuck check failed, and the
+  email never came. A retry can now, at worst, send an email twice; it can't
+  drop one.
 
 ## Limits
 

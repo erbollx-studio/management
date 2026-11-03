@@ -39,6 +39,13 @@ import {
   senderEntry,
   senderStatus,
   taggedIds,
+  calendarLink,
+  deadlineTimes,
+  dueLine,
+  findDeadline,
+  addWorkingHours,
+  isNoReply,
+  answeredAfter,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -591,3 +598,115 @@ Deno.test('only the subject, sender, files and first lines count; no rules means
   assert.equal(matchRules(e, ['tax']).pass, false)
 })
 
+
+// ------------------------------------------------------------- deadlines --
+
+const TZ = 'Asia/Bishkek'
+// Tue 3 Nov 2026, 12:00 in Bishkek.
+const NOW = new Date(Date.UTC(2026, 10, 3, 6, 0))
+const plain = (subject: string, text: string) =>
+  readEmail(message({
+    payload: {
+      mimeType: 'text/plain',
+      headers: [{ name: 'From', value: 'billing@truckinsure.com' }, { name: 'Subject', value: subject }],
+      body: { data: b64(text) },
+    },
+  }))
+const day = (subject: string, text = '') => {
+  const d = findDeadline(plain(subject, text), NOW, TZ)
+  return d && d.y + '-' + d.m + '-' + d.d
+}
+
+Deno.test('deadlines: a date right after due, deadline, cancelled, expires, renewal or "by"', () => {
+  assert.equal(day('Final notice: policy #A-4411 past due',
+    'Your premium of $1,850 was due Oct 30. Coverage will be cancelled on Nov 10 unless payment is received.'),
+    '2026-11-10')
+  assert.equal(day('Invoice INV-2231', 'Invoice Date: 11/01/2026\nDue Date: 11/30/2026\nAmount: $500'), '2026-11-30')
+  assert.equal(day('W-9', 'Please send the signed W-9 by 11/7. Thank you'), '2026-11-7')
+  assert.equal(day('Renewal', 'Your policy renewal date is December 1st, 2026.'), '2026-12-1')
+  assert.equal(day('Payment due 2026-11-20'), '2026-11-20')
+  assert.equal(day('Deadline: 15 November'), '2026-11-15')
+  assert.equal(day('Notice', 'The amount is due on or before Nov. 15, 2026.'), '2026-11-15')
+  assert.equal(day('Your COI expires 12/31/26'), '2026-12-31')
+  // Today counts; a month that already passed means next year.
+  assert.equal(day('Payment due Nov 3'), '2026-11-3')
+  assert.equal(day('Payment due Jan 5'), '2027-1-5')
+  // Several: the soonest.
+  assert.equal(day('Plan', 'First installment due 12/15, second due 11/15'), '2026-11-15')
+})
+
+Deno.test('deadlines: no date without a due word, past dates, "due to", nonsense and far-off dates', () => {
+  assert.equal(day('Closed', 'Due to the holiday, the office is closed on Nov 11.'), null)
+  assert.equal(day('Delivered', 'Delivered on 11/02, invoice attached'), null)
+  assert.equal(day('Reminder', 'Your premium was due Oct 30.'), null)
+  assert.equal(day('Support', 'Our line expires never, 24/7 support'), null)
+  assert.equal(day('Policy', 'This policy expires 11/10/2029.'), null)
+  assert.equal(day('Pay by Feb 30'), null)
+  // A due word in one sentence doesn't reach a date in another.
+  assert.equal(day('Statement', 'Nothing is due. We spoke on Nov 20 about it.'), null)
+})
+
+Deno.test('deadline reminders: 3 days before and on the day at 9:00, only those still ahead', () => {
+  const iso = (ts: Date[]) => ts.map((t) => t.toISOString())
+  assert.deepEqual(iso(deadlineTimes({ y: 2026, m: 11, d: 10 }, NOW, TZ)),
+    ['2026-11-07T03:00:00.000Z', '2026-11-10T03:00:00.000Z'])
+  assert.deepEqual(iso(deadlineTimes({ y: 2026, m: 11, d: 4 }, NOW, TZ)), ['2026-11-04T03:00:00.000Z'])
+  assert.deepEqual(iso(deadlineTimes({ y: 2026, m: 11, d: 3 }, NOW, TZ)), [])
+  // Across a month: 3 days before 2 Dec is 29 Nov.
+  assert.equal(deadlineTimes({ y: 2026, m: 12, d: 2 }, NOW, TZ)[0].toISOString(), '2026-11-29T03:00:00.000Z')
+})
+
+Deno.test('deadline line, calendar link and buttons', () => {
+  assert.equal(dueLine({ y: 2026, m: 11, d: 10 }, NOW, TZ), '📅 Due Tue 10 Nov (in 7 days)')
+  assert.equal(dueLine({ y: 2026, m: 11, d: 4 }, NOW, TZ), '📅 Due Wed 4 Nov (tomorrow)')
+  assert.equal(dueLine({ y: 2026, m: 11, d: 3 }, NOW, TZ), '📅 Due Tue 3 Nov (today)')
+  const url = new URL(calendarLink({ y: 2026, m: 12, d: 31 }, 'Policy renewal', 'https://mail.google.com/x'))
+  assert.equal(url.origin + url.pathname, 'https://calendar.google.com/calendar/render')
+  assert.equal(url.searchParams.get('action'), 'TEMPLATE')
+  assert.equal(url.searchParams.get('dates'), '20261231/20270101')
+  assert.equal(url.searchParams.get('text'), 'Due: Policy renewal')
+  assert.equal(url.searchParams.get('details'), 'https://mail.google.com/x')
+
+  const id = '18f0a1b2c3d4e5f6a7b8'
+  const kb = emailKeyboard(7, id, 'u', 'min', 0, '', { url: 'https://cal', done: false })
+  assert.deepEqual(kb.inline_keyboard.map((r) => r.map((b) => b.callback_data ?? b.url)), [
+    ['https://cal', 'Z:7:' + id],
+    ['v:7:' + id, 'R:7:' + id, 'T:7:' + id, 'd:7:' + id, 's:7:' + id],
+  ])
+  assert.deepEqual(kb.inline_keyboard[0].map((b) => b.text), ['📅 Add to Calendar', '✕ Wrong date'])
+  const done = emailKeyboard(7, id, 'u', 'more', 0, '', { url: 'https://cal', done: true })
+  assert.deepEqual(done.inline_keyboard[1].map((b) => b.text), ['📅 Add to Calendar', '✓ Done'])
+
+  const e = plain('Renewal', 'Hello')
+  const t = cardText({ label: '💰 Insurance payment', email: e, inbox: { email: 'a@b.com', name: '' }, link: 'L',
+    timeZone: TZ, body: 'Hello', due: '📅 Due Tue 10 Nov (in 7 days)' })
+  assert.deepEqual(t.split('\n').slice(3), ['<b>Subject:</b> <a href="L">Renewal</a>', '📅 Due Tue 10 Nov (in 7 days)', 'Hello'])
+})
+
+// ------------------------------------------------------- nobody answered --
+
+Deno.test('working hours: 8:00-20:00 in Bishkek, every day; nights are skipped', () => {
+  const at = (d: number, h: number, min = 0) => atLocal(TZ, 2026, 11, d, h, min)
+  const plus4 = (t: Date) => addWorkingHours(t, 4, TZ).toISOString()
+  assert.equal(plus4(at(3, 12)), at(3, 16).toISOString())
+  assert.equal(plus4(at(3, 18)), at(4, 10).toISOString()) // 2 hours tonight, 2 tomorrow morning
+  assert.equal(plus4(at(3, 23)), at(4, 12).toISOString()) // at night: from 8:00
+  assert.equal(plus4(at(4, 5, 30)), at(4, 12).toISOString())
+  assert.equal(plus4(at(3, 16)), at(3, 20).toISOString())
+  assert.equal(plus4(at(3, 20)), at(4, 12).toISOString())
+  assert.equal(plus4(at(7, 9)), at(7, 13).toISOString()) // Saturday counts too
+})
+
+Deno.test('no-reply senders get no "nobody answered" check', () => {
+  for (const a of ['noreply@x.com', 'no-reply@bank.com', 'do-not-reply@a.io', 'donotreply@b.com',
+    'notifications@github.com', 'mailer-daemon@googlemail.com', 'no_reply@x.com']) assert.ok(isNoReply(a), a)
+  for (const a of ['anna@truckinsure.com', 'noah@broker.com', 'replies@x.com', 'notary@law.com']) assert.ok(!isNoReply(a), a)
+})
+
+Deno.test('answered: a sent message in the conversation after the email', () => {
+  const thread = (msgs: [string[], number][]) => ({ messages: msgs.map(([labelIds, t]) => ({ labelIds, internalDate: String(t) })) })
+  assert.ok(answeredAfter(thread([[['INBOX'], 100], [['SENT'], 200]]), 100))
+  assert.ok(!answeredAfter(thread([[['SENT'], 50], [['INBOX'], 100]]), 100)) // the answer was to an older email
+  assert.ok(!answeredAfter(thread([[['INBOX', 'UNREAD'], 100]]), 100))
+  assert.ok(!answeredAfter({}, 100))
+})
