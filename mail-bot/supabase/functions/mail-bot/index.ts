@@ -1350,6 +1350,8 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
       })
       if (error) throw new Error('reminder: ' + error.message)
       await remove(chat, messageId)
+      // You picked when it comes back, so no "⏳ No reply yet" for it on top.
+      await clearUnanswered(ib.id, m.threadId)
       return '⏰ It comes back ' + fmtWhen(due, now, tz) + '.'
     }
   }
@@ -1394,7 +1396,10 @@ async function scheduleDeadline(ib: Inbox, email: Email, day: Day, tz: string): 
 
 /** A 📅 reminder that is due: the card comes back marked "📅 Reminder", with ✓ Done. */
 async function sendDeadline(ib: Inbox, r: Reminder, chat: string, ctx: Ctx): Promise<void> {
-  await postCard(ib, await fetchEmail(ib, r.message_id), chat, ctx, 'min', '📅 Reminder', { done: true })
+  const email = await fetchEmail(ib, r.message_id)
+  // Stopped meanwhile (✕ Wrong date while this one waited for a retry), or the date passed: nothing to remind.
+  if (!(await deadlineOf(ib, email, ctx))) return
+  await postCard(ib, email, chat, ctx, 'min', '📅 Reminder', { done: true })
 }
 
 /** ✕ Wrong date / ✓ Done: no more 📅 reminders for this conversation, and the card loses its 📅 line. */
