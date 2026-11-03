@@ -87,6 +87,13 @@ const CARD_CHARS = 200
 const PREVIEW_CHARS = 1200
 const FULL_CHARS = 3300
 const MAX_EMAILS_PER_RUN = 15
+/** A check stops taking new emails after this; the rest comes next minute. */
+const RUN_MS = 40_000
+/** One check at a time. A check that was cut off frees the lock after this. */
+const LOCK_MS = 3 * 60_000
+const TG_TIMEOUT_MS = 20_000
+const TG_FILE_TIMEOUT_MS = 120_000
+const GMAIL_TIMEOUT_MS = 30_000
 const MAX_ATTACHMENTS = 10
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 const EXPIRY_MARGIN_MS = 60_000
@@ -168,6 +175,8 @@ interface Ctx {
   tag: string
   /** Night hours when cards arrive without sound (🔴 still rings), or null for never. */
   quiet: { from: number; to: number } | null
+  /** During a mail check: the time (ms) after which it takes no new emails. */
+  until?: number
 }
 
 // ---------------------------------------------------------------- helpers --
@@ -271,16 +280,21 @@ async function tg(method: string, payload: Record<string, unknown> | FormData): 
     const { data } = await db.rpc('mailbot_bot_token')
     botToken = data ?? ''
   }
-  const init: RequestInit = payload instanceof FormData
+  const isFile = payload instanceof FormData
+  const init: RequestInit = isFile
     ? { method: 'POST', body: payload }
     : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
   for (let attempt = 0; ; attempt++) {
     let body: TgResult
     try {
-      const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, init)
+      // Telegram once hung for two minutes; a call that never ends would hold up the whole check.
+      const signal = AbortSignal.timeout(isFile ? TG_FILE_TIMEOUT_MS : TG_TIMEOUT_MS)
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, { ...init, signal })
       body = await res.json()
     } catch (e) {
-      if (attempt < 2) {
+      // A timeout isn't tried again here: Telegram may have taken the message anyway.
+      const timedOut = e instanceof DOMException && e.name === 'TimeoutError'
+      if (attempt < 2 && !timedOut) {
         await sleep(1000)
         continue
       }
@@ -371,6 +385,7 @@ async function postToken(params: Record<string, string>): Promise<TokenResponse>
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(params),
+    signal: AbortSignal.timeout(GMAIL_TIMEOUT_MS),
   })
   return await res.json()
 }
@@ -420,6 +435,7 @@ async function gmail(ib: Inbox, path: string, body?: unknown, chat?: string): Pr
     method: body ? 'POST' : 'GET',
     headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(GMAIL_TIMEOUT_MS),
   })
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 300)
@@ -437,6 +453,7 @@ async function fetchEmail(ib: Inbox, id: string): Promise<Email> {
 async function pollAll(cfg: Config): Promise<number> {
   const chat = cfg.owner_chat_id
   const ctx = await loadCtx(cfg)
+  ctx.until = Date.now() + RUN_MS
   const counts = await Promise.all((await connectedInboxes()).map(async (ib) => {
     try {
       return await pollInbox(ib, chat, ctx)
@@ -514,41 +531,56 @@ async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
   }
   const latest = BigInt(arrived.latest) > BigInt(tagging.latest) ? arrived.latest : tagging.latest
 
-  // Tagged emails first. Their claim is "tag:<id>", so an email already posted
+  // Tagged emails first. Their key is "tag:<id>", so an email already posted
   // (or held back) when it arrived still comes once more when it gets the tag.
   const jobs = [...tagged.map((id) => ({ id, tagged: true })), ...ids.map((id) => ({ id, tagged: false }))]
-  const batch = jobs.slice(0, MAX_EMAILS_PER_RUN).map((j) => ({ ...j, key: (j.tagged ? 'tag:' : '') + j.id }))
+    .map((j) => ({ ...j, key: (j.tagged ? 'tag:' : '') + j.id }))
+  const done = await seenKeys(ib.id, jobs.map((j) => j.key))
   let posted = 0
-  let retry = false
-  if (batch.length) {
-    // Claim before posting, so overlapping runs never post the same email twice.
-    const { data: claimed } = await db.from('mailbot_seen')
-      .upsert(batch.map((j) => ({ inbox_id: ib.id, message_id: j.key })), {
-        onConflict: 'inbox_id,message_id',
-        ignoreDuplicates: true,
-      })
-      .select('message_id')
-    const mine = new Set((claimed ?? []).map((r) => r.message_id))
-    for (const job of batch) {
-      if (!mine.has(job.key)) continue
-      try {
-        if (await deliver(ib, job.id, chat, ctx, job.tagged)) posted++
-      } catch (e) {
-        if (e instanceof GmailError && e.status === 404) continue // deleted before we got to it
-        console.error('deliver', ib.email, job.id, e)
-        if (e instanceof TelegramError && !e.transient) continue
-        retry = true
-        await db.from('mailbot_seen').delete().eq('inbox_id', ib.id).eq('message_id', job.key)
+  let handled = 0
+  let finished = true
+  for (const job of jobs) {
+    if (done.has(job.key)) continue
+    if (handled === MAX_EMAILS_PER_RUN || Date.now() > (ctx.until ?? Infinity)) {
+      finished = false
+      break
+    }
+    handled++
+    try {
+      if (await deliver(ib, job.id, chat, ctx, job.tagged)) posted++
+    } catch (e) {
+      const gone = e instanceof GmailError && e.status === 404 // deleted before we got to it
+      if (!gone) console.error('deliver', ib.email, job.id, e)
+      if (!gone && !(e instanceof TelegramError && !e.transient)) {
+        // Worth another try: it stays unmarked and the cursor stays, so it comes again next minute.
+        finished = false
+        continue
       }
     }
+    // Marked only once it's handled. Marking first lost an email: a check stuck
+    // on Telegram held the mark, the next check stepped past it, then the stuck one failed.
+    await db.from('mailbot_seen')
+      .upsert({ inbox_id: ib.id, message_id: job.key }, { onConflict: 'inbox_id,message_id', ignoreDuplicates: true })
   }
 
-  // A capped or failed run keeps the cursor, so the rest comes next minute;
-  // mailbot_seen skips whatever was already posted.
+  // A cut-short or failed run keeps the cursor, so the rest comes next minute;
+  // mailbot_seen skips whatever was already handled.
   const update: Record<string, unknown> = { last_checked_at: now, last_error: null }
-  if (!retry && jobs.length <= batch.length) update.history_id = latest
+  if (finished) update.history_id = latest
   await db.from('mailbot_inboxes').update(update).eq('id', ib.id)
   return posted
+}
+
+/** Which of these keys mailbot_seen already has. A failed read stops the check rather than post everything again. */
+async function seenKeys(inboxId: number, keys: string[]): Promise<Set<string>> {
+  const done = new Set<string>()
+  for (let i = 0; i < keys.length; i += 100) {
+    const { data, error } = await db.from('mailbot_seen').select('message_id')
+      .eq('inbox_id', inboxId).in('message_id', keys.slice(i, i + 100))
+    if (error) throw new Error('mailbot_seen: ' + error.message)
+    for (const r of data ?? []) done.add(r.message_id)
+  }
+  return done
 }
 
 /**
@@ -616,15 +648,16 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
     })
     return false
   }
+  await postCard(ib, email, chat, ctx, 'min')
   if (d.send === 'ask') {
     // Asked once: until the answer, this sender's next money emails go to the daily list.
+    // Only after the card arrived, so a failed send asks again on the retry.
     ctx.senders[d.sender] = 'asked'
     await db.from('mailbot_senders').upsert({ entry: d.sender, status: 'asked' }, {
       onConflict: 'entry',
       ignoreDuplicates: true,
     })
   }
-  await postCard(ib, email, chat, ctx, 'min')
   return true
 }
 
@@ -789,7 +822,16 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
         await send(chat, '⏸ Paused. /resume first.')
         return
       }
-      if (!(await pollAll(cfg))) await send(chat, '📭 Nothing new.', TRASH)
+      const lock = await takeLock()
+      if (!lock) {
+        await send(chat, '⏳ A check is running right now. New emails come within a minute.', TRASH)
+        return
+      }
+      try {
+        if (!(await pollAll(cfg))) await send(chat, '📭 Nothing new.', TRASH)
+      } finally {
+        await dropLock(lock)
+      }
       return
     }
     case '/mute':
@@ -1613,18 +1655,48 @@ async function handleCron(req: Request): Promise<Response> {
   return json({ ok: true })
 }
 
-/** The once-a-minute work: new mail first, then reminders. A failure in one never stops the other. */
+/**
+ * The once-a-minute work: new mail first, then reminders. A failure in one
+ * never stops the other. If the last minute's check is still running, this one
+ * steps aside instead of racing it over the same emails.
+ */
 async function tick(cfg: Config): Promise<void> {
+  const lock = await takeLock()
+  if (!lock) return
   try {
-    await pollAll(cfg)
-  } catch (e) {
-    console.error('cron', e)
+    try {
+      await pollAll(cfg)
+    } catch (e) {
+      console.error('cron', e)
+    }
+    try {
+      await runReminders(cfg)
+    } catch (e) {
+      console.error('reminders', e)
+    }
+  } finally {
+    await dropLock(lock)
   }
-  try {
-    await runReminders(cfg)
-  } catch (e) {
-    console.error('reminders', e)
-  }
+}
+
+/**
+ * One mail check at a time (the minute's run or /check). The lock is the
+ * mailbot_config row "run_lock" holding when it runs out, so a check that was
+ * cut off frees it by itself. Returns that time, or null if it's taken.
+ */
+async function takeLock(): Promise<string | null> {
+  const until = new Date(Date.now() + LOCK_MS).toISOString()
+  const { data } = await db.from('mailbot_config').update({ value: until })
+    .eq('key', 'run_lock').lt('value', new Date().toISOString()).select('key')
+  if (data?.length) return until
+  // The very first time there is no row yet.
+  const { data: made } = await db.from('mailbot_config')
+    .upsert({ key: 'run_lock', value: until }, { onConflict: 'key', ignoreDuplicates: true }).select('key')
+  return made?.length ? until : null
+}
+
+async function dropLock(until: string): Promise<void> {
+  await db.from('mailbot_config').update({ value: '' }).eq('key', 'run_lock').eq('value', until)
 }
 
 /** Public and deliberately boring: counts and ages only, no addresses. */
