@@ -28,7 +28,11 @@ import {
   preview,
   shouldSkip,
   similarWords,
+  atLocal,
+  isQuiet,
   loadMark,
+  localParts,
+  parseQuiet,
   senderEntry,
   senderStatus,
   taggedIds,
@@ -345,6 +349,30 @@ Deno.test('decide: 🔴 and ⭐ always, loads never, money only from allowed sen
   // The inbox's own words come, except on load emails.
   assert.equal(decide(email('Hi Erbol', 'Erbol, call me', 'x@y.com'), [], ['erbol'], {}).send, 'chat')
   assert.equal(decide(email('Load #12 for Erbol', 'Erbol', 'x@y.com'), [], ['erbol'], {}).send, 'list')
+})
+
+Deno.test('time: the clock in Bishkek, and moments from it', () => {
+  const tz = 'Asia/Bishkek' // UTC+6
+  assert.deepEqual(localParts(new Date('2026-11-03T17:30:00Z'), tz), { y: 2026, m: 11, d: 3, h: 23, min: 30 })
+  assert.deepEqual(localParts(new Date('2026-11-03T18:05:00Z'), tz), { y: 2026, m: 11, d: 4, h: 0, min: 5 })
+  assert.equal(atLocal(tz, 2026, 11, 4, 9).toISOString(), '2026-11-04T03:00:00.000Z')
+  assert.equal(atLocal(tz, 2026, 11, 31, 9).toISOString(), '2026-12-01T03:00:00.000Z') // rolls over
+  assert.equal(atLocal('America/Chicago', 2026, 7, 1, 9).toISOString(), '2026-07-01T14:00:00.000Z')
+})
+
+Deno.test('quiet hours: 22-7 runs past midnight; off and nonsense mean never', () => {
+  const tz = 'Asia/Bishkek'
+  const at = (h: number) => atLocal(tz, 2026, 11, 3, h, 30)
+  const night = parseQuiet('22-7')
+  assert.deepEqual(night, { from: 22, to: 7 })
+  assert.deepEqual([21, 22, 23, 0, 3, 6, 7, 12].map((h) => isQuiet(at(h), tz, night)),
+    [false, true, true, true, true, true, false, false])
+  const nap = parseQuiet('13 - 15')
+  assert.deepEqual([12, 13, 14, 15].map((h) => isQuiet(at(h), tz, nap)), [false, true, true, false])
+  assert.equal(parseQuiet('off'), null)
+  assert.equal(parseQuiet('25-7'), null)
+  assert.equal(parseQuiet('7-7'), null)
+  assert.equal(isQuiet(at(23), tz, null), false)
 })
 
 Deno.test('tag: emails tagged by hand or by a Gmail filter, one per conversation, the newest', () => {

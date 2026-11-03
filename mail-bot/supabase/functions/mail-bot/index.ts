@@ -16,8 +16,10 @@ import {
   inboxName,
   INSURANCE_WORDS,
   isMuted,
+  isQuiet,
   MONEY_WORDS,
   muteEntry,
+  parseQuiet,
   parseRules,
   type Person,
   preview,
@@ -90,6 +92,7 @@ const FILTER_WAIT_MS = 10 * 60_000
 const DIGEST_ITEMS = 20
 const DEFAULT_TAG = 'erbol'
 const TAG_RECHECK_MS = 60 * 60_000
+const DEFAULT_QUIET = '22-7'
 
 /** A 🗑 button for messages that are not email cards (files, lists, confirmations). */
 const TRASH = { inline_keyboard: [[{ text: '🗑', callback_data: 'X' }]] }
@@ -108,6 +111,7 @@ const HELP = [
   '/skipped: emails that fit no template (the daily list)',
   '/muted: what you stopped with 🔕, tap to undo',
   '/check: check all inboxes now',
+  '/quiet: night hours without sound (only 🔴 rings)',
   '/pause, /resume: stop or restart notifications',
   '/status: is everything working',
   '',
@@ -147,6 +151,8 @@ interface Ctx {
   senders: Record<string, string>
   /** The Gmail label name that sends an email here whatever the filters. */
   tag: string
+  /** Night hours when cards arrive without sound (🔴 still rings), or null for never. */
+  quiet: { from: number; to: number } | null
 }
 
 // ---------------------------------------------------------------- helpers --
@@ -223,6 +229,7 @@ async function loadCtx(cfg: Config): Promise<Ctx> {
     people: (people ?? []) as Person[],
     senders: Object.fromEntries((senders ?? []).map((s) => [s.entry, s.status])),
     tag: cfg.tag_label || DEFAULT_TAG,
+    quiet: parseQuiet(cfg.quiet_hours ?? DEFAULT_QUIET),
   }
 }
 
@@ -274,7 +281,8 @@ async function tg(method: string, payload: Record<string, unknown> | FormData): 
   }
 }
 
-async function send(chat: string, text: string, markup?: unknown, replyTo?: number): Promise<TgResult> {
+/** `silent`: the message arrives without sound or vibration. */
+async function send(chat: string, text: string, markup?: unknown, replyTo?: number, silent = false): Promise<TgResult> {
   const payload: Record<string, unknown> = {
     chat_id: chat,
     text,
@@ -283,6 +291,7 @@ async function send(chat: string, text: string, markup?: unknown, replyTo?: numb
   }
   if (markup) payload.reply_markup = markup
   if (replyTo) payload.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true }
+  if (silent) payload.disable_notification = true
   let res = await tg('sendMessage', payload)
   if (!res.ok && /parse entities/i.test(res.description ?? '')) {
     payload.text = decodeEntities(text.replace(/<[^>]+>/g, ''))
@@ -606,8 +615,15 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
 
 // ------------------------------------------------------------------ cards --
 
+interface Card {
+  text: string
+  markup: { inline_keyboard: Button[][] }
+  /** 🔴 urgent insurance: rings even in the quiet hours. */
+  urgent: boolean
+}
+
 /** A card's text and buttons. A money email from a sender with no answer yet carries ✓ Allow / ✕ Not money. */
-function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View): { text: string; markup: { inline_keyboard: Button[][] } } {
+function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View): Card {
   const d = decide(email, ctx.people, ib.keywords, ctx.senders)
   const isTagged = Boolean(ib.tag_label_id) && email.labelIds.includes(ib.tag_label_id!)
   const label = (isTagged ? '📌 ' + ctx.tag + (d.label ? ' · ' : '') : '') + d.label + (d.asking ? ' · 🆕 new sender' : '')
@@ -629,12 +645,18 @@ function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View): { text: stri
     text = cardText({ ...base, details: true, tags: d.tags, body })
   }
   const files = Math.min(email.attachments.length, MAX_ATTACHMENTS)
-  return { text, markup: emailKeyboard(ib.id, email.id, link, view, files, d.asking ? d.sender : '') }
+  return {
+    text,
+    markup: emailKeyboard(ib.id, email.id, link, view, files, d.asking ? d.sender : ''),
+    urgent: d.kind === 'urgent',
+  }
 }
 
+/** Posts a card; in the quiet hours it arrives without sound, unless it's 🔴 urgent. */
 async function postCard(ib: Inbox, email: Email, chat: string, ctx: Ctx, view: View): Promise<void> {
   const card = renderCard(ib, email, ctx, view)
-  const res = await send(chat, card.text, card.markup)
+  const silent = !card.urgent && isQuiet(new Date(), ctx.tz, ctx.quiet)
+  const res = await send(chat, card.text, card.markup, undefined, silent)
   if (!res.ok) throw new TelegramError(res)
 }
 
@@ -757,6 +779,8 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdMute(chat, arg, false)
     case '/muted':
       return await cmdMuted(chat)
+    case '/quiet':
+      return await cmdQuiet(cfg, chat, arg)
     case '/pause':
       await setConfig('paused', 'true')
       await send(chat, '⏸ Paused. /resume turns emails back on.', TRASH)
@@ -1001,6 +1025,25 @@ async function cmdTemplates(chat: string): Promise<void> {
     'tender, pickup, lanes like "NV to Rocklin, CA".',
     '💵 🧾 and 💰 come only from senders you allowed (/senders). 🔴, ⭐ and 📌 always come.',
   ].join('\n'), TRASH)
+}
+
+/** /quiet shows the night hours, /quiet 23-6 changes them, /quiet off turns them off. */
+async function cmdQuiet(cfg: Config, chat: string, arg: string): Promise<void> {
+  let value = cfg.quiet_hours ?? DEFAULT_QUIET
+  if (arg) {
+    if (!/^\s*off\s*$/i.test(arg) && !parseQuiet(arg)) {
+      await send(chat, 'Usage: /quiet 22-7 (from 22:00 to 7:00), or /quiet off', TRASH)
+      return
+    }
+    value = /off/i.test(arg) ? 'off' : arg.trim()
+    await setConfig('quiet_hours', value)
+  }
+  const quiet = parseQuiet(value)
+  const hh = (h: number) => String(h).padStart(2, '0') + ':00'
+  await send(chat, quiet
+    ? '🌙 <b>Quiet hours ' + hh(quiet.from) + '–' + hh(quiet.to) + '</b>. Emails still come, but without sound. ' +
+      'Only 🔴 urgent insurance rings.\n\nChange: /quiet 23-6 · Turn off: /quiet off'
+    : '🔔 Quiet hours are off: every email rings.\n\nTurn on: /quiet 22-7', TRASH)
 }
 
 async function cmdStatus(cfg: Config, chat: string): Promise<void> {

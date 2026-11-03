@@ -624,6 +624,45 @@ export function decide(email: Email, people: Person[], rules: string[], senders:
   return { ...base, send: 'chat' }
 }
 
+// ------------------------------------------------------------------ time --
+
+/** The wall clock in `tz` at `d`: year, month (1-12), day, hour (0-23), minute. */
+export function localParts(d: Date, tz: string): { y: number; m: number; d: number; h: number; min: number } {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: 'numeric',
+      hourCycle: 'h23',
+    }).formatToParts(d).map((p) => [p.type, p.value]),
+  )
+  return { y: +parts.year, m: +parts.month, d: +parts.day, h: +parts.hour, min: +parts.minute }
+}
+
+/** The moment the clock in `tz` shows y-m-d h:min. Days past the month's end roll over. */
+export function atLocal(tz: string, y: number, m: number, d: number, h = 0, min = 0): Date {
+  const guess = Date.UTC(y, m - 1, d, h, min)
+  const p = localParts(new Date(guess), tz)
+  return new Date(guess - (Date.UTC(p.y, p.m - 1, p.d, p.h, p.min) - guess))
+}
+
+/** Quiet hours from what was typed: "22-7" → 22:00 to 7:00; "off" or nonsense → none. */
+export function parseQuiet(s: string): { from: number; to: number } | null {
+  const m = /^\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\s*$/.exec(s)
+  if (!m || +m[1] > 23 || +m[2] > 23 || +m[1] === +m[2]) return null
+  return { from: +m[1], to: +m[2] }
+}
+
+/** Whether `now` is inside the quiet hours in `tz`; 22-7 runs past midnight. */
+export function isQuiet(now: Date, tz: string, quiet: { from: number; to: number } | null): boolean {
+  if (!quiet) return false
+  const h = localParts(now, tz).h
+  return quiet.from > quiet.to ? h >= quiet.from || h < quiet.to : h >= quiet.from && h < quiet.to
+}
+
 // -------------------------------------------------------------- telegram --
 
 export function esc(s: string): string {

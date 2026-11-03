@@ -94,6 +94,10 @@ The subject links to the email in Gmail. The inbox name comes from Gmail.
 Other bot messages (files, lists, confirmations) have a 🗑 button too, so the
 chat stays clean. Emails in the Promotions and Social tabs are skipped.
 
+**Quiet hours** (`/quiet`, 22:00–7:00 at first): cards still arrive, but
+without sound or vibration. Only 🔴 urgent insurance rings. `/quiet 23-6`
+changes the hours, `/quiet off` turns them off.
+
 ## Extra words per inbox
 
 On top of the templates, an inbox can let through emails with its own words.
@@ -124,6 +128,7 @@ On top of the templates, an inbox can let through emails with its own words.
 | `/skipped` | Emails that fit no template |
 | `/muted` | What you stopped with 🔕; tap one to undo |
 | `/check` | Check all inboxes now |
+| `/quiet`, `/quiet 23-6`, `/quiet off` | Night hours without sound (🔴 still rings) |
 | `/pause`, `/resume` | Stop or restart notifications |
 | `/status` | Is everything working |
 
