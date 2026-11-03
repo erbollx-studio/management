@@ -37,6 +37,7 @@ import {
   URGENT_WORDS,
   type Attachment,
   type Button,
+  type Day,
   type HistoryRecord,
 } from './mail.ts'
 
@@ -124,6 +125,8 @@ const HELP = [
   '/quiet: night hours without sound (only 🔴 rings)',
   '/pause, /resume: stop or restart notifications',
   '/status: is everything working',
+  '📅 An email with a due date comes back 3 days before and on the day, at 9:00.',
+  '⏳ A ⭐ or 📌 email nobody answered in 4 working hours comes back once.',
   '',
   'On an email: ▾ More shows the rest, ↩ Reply answers it, ⏰ brings it back later, 🗑 removes it from this chat ' +
   '(it stays in Gmail), 🔕 stops emails like it.',
@@ -630,7 +633,7 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
   if (tagged) {
     // The tag is a request: it beats templates, filters and 🔕. Only spam and the bin stay out.
     if (email.labelIds.some((l) => l === 'SPAM' || l === 'TRASH')) return false
-    await postCard(ib, email, chat, ctx, 'min')
+    await afterPost(ib, email, ctx, true, await postCard(ib, email, chat, ctx, 'min'))
     return true
   }
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
@@ -648,7 +651,7 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
     })
     return false
   }
-  await postCard(ib, email, chat, ctx, 'min')
+  const due = await postCard(ib, email, chat, ctx, 'min')
   if (d.send === 'ask') {
     // Asked once: until the answer, this sender's next money emails go to the daily list.
     // Only after the card arrived, so a failed send asks again on the retry.
@@ -658,7 +661,26 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
       ignoreDuplicates: true,
     })
   }
+  await afterPost(ib, email, ctx, false, due)
   return true
+}
+
+/**
+ * After a new email reached the chat: its 📅 deadline reminders and its
+ * "nobody answered" check. A failure here is logged and never fails the
+ * delivery, so the email is still marked as handled.
+ */
+async function afterPost(ib: Inbox, email: Email, ctx: Ctx, tagged: boolean, due: Day | null): Promise<void> {
+  try {
+    if (due) await scheduleDeadline(ib, email, due, ctx.tz)
+  } catch (e) {
+    console.error('deadline', ib.email, email.id, e)
+  }
+  try {
+    await scheduleUnanswered(ib, email, ctx, tagged)
+  } catch (e) {
+    console.error('unanswered', ib.email, email.id, e)
+  }
 }
 
 // ------------------------------------------------------------------ cards --
@@ -704,12 +726,26 @@ function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View, prefix = ''):
   }
 }
 
-/** Posts a card; in the quiet hours it arrives without sound, unless it's 🔴 urgent. */
-async function postCard(ib: Inbox, email: Email, chat: string, ctx: Ctx, view: View, prefix = ''): Promise<void> {
+/**
+ * Posts a card; in the quiet hours it arrives without sound, unless it's 🔴
+ * urgent. `opts.quiet`: without sound anyway. `opts.done`: a 📅 reminder card,
+ * so it offers ✓ Done instead of ✕ Wrong date. Returns the email's due date, or null.
+ */
+async function postCard(
+  ib: Inbox,
+  email: Email,
+  chat: string,
+  ctx: Ctx,
+  view: View,
+  prefix = '',
+  opts: { quiet?: boolean; done?: boolean } = {},
+): Promise<Day | null> {
+  const due: Day | null = null
   const card = renderCard(ib, email, ctx, view, prefix)
-  const silent = !card.urgent && isQuiet(new Date(), ctx.tz, ctx.quiet)
+  const silent = opts.quiet || (!card.urgent && isQuiet(new Date(), ctx.tz, ctx.quiet))
   const res = await send(chat, card.text, card.markup, undefined, silent)
   if (!res.ok) throw new TelegramError(res)
+  return due
 }
 
 // deno-lint-ignore no-explicit-any
@@ -1207,8 +1243,11 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
       const m = await gmail(ib, `messages/${id}?format=minimal`)
       await gmail(ib, `threads/${m.threadId}/modify`, { removeLabelIds: ['INBOX', 'UNREAD'] })
       await remove(chat, messageId)
+      await clearUnanswered(ib.id, m.threadId)
       return 'Archived in Gmail'
     }
+    case 'Z':
+      return await stopDeadline(q, ib, id, cfg)
     case 's': {
       const email = readEmail(await gmail(ib, `messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`))
       await tg('editMessageReplyMarkup', { chat_id: chat, message_id: messageId, reply_markup: stopKeyboard(ib.id, email) })
@@ -1287,6 +1326,25 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
   return ''
 }
 
+// -------------------------------------------------------------- deadlines --
+
+/** Saves the 📅 reminders for a new email's due date: 3 days before and on the day, at 9:00. */
+async function scheduleDeadline(_ib: Inbox, _email: Email, _day: Day, _tz: string): Promise<void> {
+  // TODO(deadlines)
+}
+
+/** A 📅 reminder that is due: the card comes back marked "📅 Reminder", with ✓ Done. */
+async function sendDeadline(_ib: Inbox, _r: Reminder, _chat: string, _ctx: Ctx): Promise<void> {
+  // TODO(deadlines)
+}
+
+/** ✕ Wrong date / ✓ Done: no more 📅 reminders for this conversation, and the card loses its 📅 line. */
+// deno-lint-ignore no-explicit-any
+async function stopDeadline(_q: any, _ib: Inbox, _id: string, _cfg: Config): Promise<string> {
+  // TODO(deadlines)
+  return await Promise.resolve('')
+}
+
 // -------------------------------------------------------------- reminders --
 
 /**
@@ -1297,17 +1355,22 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
  */
 async function runReminders(cfg: Config): Promise<void> {
   const chat = cfg.owner_chat_id
+  // note "off": a deadline you stopped (✕ Wrong date / ✓ Done); those rows are never sent.
   const { data, error } = await db.from('mailbot_reminders').select('*').lte('due_at', new Date().toISOString())
-    .order('due_at').limit(20)
+    .neq('note', 'off').order('due_at').limit(20)
   if (error) throw new Error('reminders: ' + error.message)
   if (!data?.length) return
   const ctx = await loadCtx(cfg)
+  // Several "no reply yet" cards at once: only the first one rings.
+  const run = { rang: false }
   for (const r of data as Reminder[]) {
     const { data: mine } = await db.from('mailbot_reminders').delete().eq('id', r.id).select('id').maybeSingle()
     if (!mine) continue
     try {
       const ib = await inboxById(r.inbox_id)
       if (r.kind === 'later') await postCard(ib, await fetchEmail(ib, r.message_id), chat, ctx, 'min', '⏰ Reminder')
+      else if (r.kind === 'deadline') await sendDeadline(ib, r, chat, ctx)
+      else if (r.kind === 'unanswered') await sendUnanswered(ib, r, chat, ctx, run)
     } catch (e) {
       if (e instanceof GmailError && e.status === 404) continue
       console.error('reminder', r.id, e)
@@ -1321,6 +1384,23 @@ async function runReminders(cfg: Config): Promise<void> {
       }
     }
   }
+}
+
+// -------------------------------------------------------- nobody answered --
+
+/** For a ⭐ or 📌 email from a real person: check in 4 working hours whether anyone answered. */
+async function scheduleUnanswered(_ib: Inbox, _email: Email, _ctx: Ctx, _tagged: boolean): Promise<void> {
+  // TODO(unanswered)
+}
+
+/** A due "nobody answered" check: if no reply went out, the card comes back marked "⏳ No reply yet". */
+async function sendUnanswered(_ib: Inbox, _r: Reminder, _chat: string, _ctx: Ctx, _run: { rang: boolean }): Promise<void> {
+  // TODO(unanswered)
+}
+
+/** The conversation was archived: no "nobody answered" check for it. */
+async function clearUnanswered(_inboxId: number, _threadId: string): Promise<void> {
+  // TODO(unanswered)
 }
 
 // ---------------------------------------------------------------- filters --
