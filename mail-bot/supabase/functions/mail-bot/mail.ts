@@ -542,6 +542,88 @@ export function classify(email: Email, people: Person[], rules: string[]): Verdi
   return v
 }
 
+// -------------------------------------------------------------- deciding --
+
+/** US states and Canadian provinces; AR and OK are left out, they are everyday words in subjects too. */
+const REGIONS = 'AL|AK|AZ|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|' +
+  'ND|OH|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC|AB|BC|MB|NB|NL|NS|ON|PE|QC|SK'
+
+/**
+ * Subjects of load emails: load and PO numbers, rate confirmations, tenders,
+ * delivery papers, pickups, and lanes like "Las Vegas, NV to Rocklin, CA",
+ * "CA >> KANSAS CITY MO" or "CA-NV". The lane check wants capital state codes.
+ */
+const LOAD_SUBJECTS = [
+  /\bloads?\s*(#\s*\w*|no\.?\s*\d\w*|number\b\s*\w*|id\b|\d\w*)/i,
+  /\bp\.?o\.?\s*#?\s*\d\w*/i,
+  /\brate\s*con/i,
+  /\b(delivery|lumper)\s+receipt/i,
+  /\bproof of delivery\b|\bpods?\b|\bbol\b|\bb\/l\b|\bbill of lading\b/i,
+  /\btender/i,
+  /\bpick[\s-]?up\b/i,
+  /\bPU\b/,
+  /\bscale ticket|\btonu\b|\bdetention\b|\blumper\b/i,
+  new RegExp('\\b(' + REGIONS + ')\\b\\s*(to|TO|To|→|>>|->|–|—|-)\\s*([A-Za-z .\'-]{0,30},?\\s*)?\\b(' + REGIONS + ')\\b'),
+]
+
+/** The load words in a subject ("Load #8646459", "Rate Confirmation", "NV to Rocklin, CA"), or ''. */
+export function loadMark(subject: string): string {
+  for (const re of LOAD_SUBJECTS) {
+    const m = re.exec(subject)
+    if (m) return m[0].trim()
+  }
+  return ''
+}
+
+/** A sender's entry on the money list: their company domain, or the address for free mail. */
+export function senderEntry(email: string): string {
+  return companyDomain(email) ?? email
+}
+
+/** A sender's answer on the money list: by address, then by domain and the domains above it. */
+export function senderStatus(senders: Record<string, string>, email: string): string | undefined {
+  if (senders[email]) return senders[email]
+  let domain = email.split('@')[1] ?? ''
+  while (domain.includes('.')) {
+    if (senders[domain]) return senders[domain]
+    domain = domain.slice(domain.indexOf('.') + 1)
+  }
+  return undefined
+}
+
+export interface Decision extends Verdict {
+  /** chat: post it. ask: post it once, with ✓ Allow / ✕ Not money. list: the daily list. */
+  send: 'chat' | 'ask' | 'list'
+  /** The money-list entry for this sender ("ecapital.com"). */
+  sender: string
+  /** A money email from a sender with no answer yet: its card carries ✓ Allow / ✕ Not money. */
+  asking: boolean
+  /** The load words that keep it out, or ''. */
+  load: string
+}
+
+/**
+ * Where an email goes. 🔴 urgent insurance and ⭐ your people always come.
+ * Load emails never do, even when they say "payment". 💰 and 🧾 money emails
+ * come only from senders on the money list (`senders`: entry → allowed,
+ * asked or denied); a sender with no entry is asked about once, after that
+ * their money emails wait for the answer in the daily list. The inbox's own
+ * words come too, unless it's a load email. Everything else: the daily list.
+ */
+export function decide(email: Email, people: Person[], rules: string[], senders: Record<string, string>): Decision {
+  const v = classify(email, people, rules)
+  const base = { ...v, sender: senderEntry(email.from.email), load: loadMark(email.subject), asking: false }
+  if (v.kind === 'urgent' || personFor(people, email.from.email)) return { ...base, send: 'chat' }
+  if (v.kind === 'none' || base.load) return { ...base, send: 'list' }
+  if (v.kind === 'money' || v.kind === 'insurance') {
+    const status = senderStatus(senders, email.from.email)
+    if (status === 'allowed') return { ...base, send: 'chat' }
+    if (status === 'denied') return { ...base, send: 'list' }
+    return { ...base, send: status === 'asked' ? 'list' : 'ask', asking: true }
+  }
+  return { ...base, send: 'chat' }
+}
+
 // -------------------------------------------------------------- telegram --
 
 export function esc(s: string): string {
@@ -629,25 +711,36 @@ export interface Button {
   url?: string
 }
 
-/** Buttons for a card: "min" is the card that arrives, "more" shows the preview, "full" the whole text. */
+/**
+ * Buttons for a card: "min" is the card that arrives, "more" shows the
+ * preview, "full" the whole text. `ask` (a money-list entry) puts ✓ Allow /
+ * ✕ Not money on top, for a money email from a sender with no answer yet.
+ */
 export function emailKeyboard(
   inboxId: number,
   id: string,
   link: string,
   view: 'min' | 'more' | 'full',
   files = 0,
+  ask = '',
 ): { inline_keyboard: Button[][] } {
   const ref = inboxId + ':' + id
+  const asking: Button[][] = ask
+    ? [[{ text: '✓ Allow ' + clip(ask, 28), callback_data: 'G:' + ref }, { text: '✕ Not money', callback_data: 'B:' + ref }]]
+    : []
+  const reply: Button = { text: '↩ Reply', callback_data: 'R:' + ref }
   const done: Button[] = [
     { text: '🗑 Delete', callback_data: 'd:' + ref },
     { text: '🔕 Stop', callback_data: 's:' + ref },
   ]
-  if (view === 'min') return { inline_keyboard: [[{ text: '▾ More', callback_data: 'v:' + ref }, ...done]] }
+  if (view === 'min') {
+    return { inline_keyboard: [...asking, [{ text: '▾ More', callback_data: 'v:' + ref }, reply, ...done]] }
+  }
   const top: Button[] = [{ text: '▴ Less', callback_data: 'c:' + ref }]
   if (view === 'more') top.push({ text: '📄 Full text', callback_data: 'f:' + ref })
   if (files) top.push({ text: '📎 ' + files, callback_data: 'p:' + ref })
   top.push({ text: '↗ Gmail', url: link })
-  return { inline_keyboard: [top, [{ text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
+  return { inline_keyboard: [...asking, top, [reply, { text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
 }
 
 /** The 🔕 choices for one email. The company choice is left out for free mail providers. */

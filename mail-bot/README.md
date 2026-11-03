@@ -27,6 +27,23 @@ contact lines ("INVOICES / BILLING: ap@broker.com"), footers and phrases like
 payment and insurance words in all of those places, so searching the whole
 email sent nearly every one of them to the chat.
 
+## What comes to the chat
+
+1. 📌 **Tagged** emails, 🔴 **urgent insurance** and ⭐ **your people**: always.
+2. 🚚 **Load emails: never**, even when they say "payment". A load email is
+   one whose subject has a load or PO number, "rate confirmation", "delivery
+   receipt", BOL, POD, tender, pickup, TONU, detention, lumper, or a lane
+   like "Las Vegas, NV to Rocklin, CA" / "CA-NV" (`LOAD_SUBJECTS` in `mail.ts`).
+3. 💵 **Money emails (🧾 💰) only from allowed senders**, the money list
+   (`/senders`). It goes by company domain, so allowing `ecapital.com` covers
+   wallet@, reports@ and every other eCapital address. A money email from a
+   sender who isn't on the list comes **once**, marked `🆕 new sender`, with
+   **✓ Allow** and **✕ Not money**. Until you answer, their next money emails
+   wait in the daily list. Tap a name in `/senders` to forget it, and the next
+   one asks again.
+4. The inbox's own words (`/filter`), unless it's a load email.
+5. Everything else: the daily list.
+
 ## The tag: 📌 erbol
 
 Put the Gmail label **erbol** on any email, in any connected inbox, and it
@@ -53,7 +70,7 @@ From: Anna Lee · anna@truckinsure.com
 To: Dan Cargo · info@dancargologisticsinc.com
 Subject: Final notice: policy #A-4411 past due
 Your premium of $1,850 was due Oct 30. Coverage will be cancelled on …
-[▾ More] [🗑 Delete] [🔕 Stop]
+[▾ More] [↩ Reply] [🗑 Delete] [🔕 Stop]
 ```
 
 The subject links to the email in Gmail. The inbox name comes from Gmail.
@@ -68,10 +85,11 @@ The subject links to the email in Gmail. The inbox name comes from Gmail.
 - **🔕 Stop** stops emails like it: from this sender, from everyone at that
   company (not offered for gmail.com and other free mail), or "emails like
   this one" (same sender, same subject apart from numbers and dates).
-- **Reply**: use Telegram's Reply on the email and type. The bot shows you the
-  reply first and sends it only after **✅ Send**. It goes out from the inbox
-  the email came to. Afterwards your typed text and the confirmation leave the
-  chat.
+- **↩ Reply**: tap it (or use Telegram's own Reply on the email) and type.
+  The bot shows you the reply first and sends it only after **✅ Send** (or
+  **👥 Reply all**). It goes out from the inbox the email came to, in the same
+  Gmail conversation. Afterwards the prompt, your typed text and the
+  confirmation leave the chat. Text only.
 
 Other bot messages (files, lists, confirmations) have a 🗑 button too, so the
 chat stays clean. Emails in the Promotions and Social tabs are skipped.
@@ -100,6 +118,7 @@ On top of the templates, an inbox can let through emails with its own words.
 | `/templates` | The templates and their words |
 | `/people` | Your ⭐ people; tap one to remove |
 | `/people name@company.com Anna Lee, insurance agent` | Add a person (or `company.com` for everyone there) |
+| `/senders` | The money list: allowed, asked, not money; tap one to forget it |
 | `/filter` | Per inbox: templates only, extra words, or all emails |
 | `/filter name@company.com erbol, load 4411` | The same in one command; `all` or `templates` switch the mode |
 | `/skipped` | Emails that fit no template |

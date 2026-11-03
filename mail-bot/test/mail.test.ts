@@ -12,6 +12,7 @@ import {
   bytesToBase64url,
   cardText,
   classify,
+  decide,
   emailKeyboard,
   type GmailMessage,
   inboxName,
@@ -27,6 +28,9 @@ import {
   preview,
   shouldSkip,
   similarWords,
+  loadMark,
+  senderEntry,
+  senderStatus,
   taggedIds,
 } from '../supabase/functions/mail-bot/mail.ts'
 
@@ -264,6 +268,85 @@ for (const [subject, body, sender, files, expected] of templateCases) {
   })
 }
 
+// Real subjects from the owner's inboxes: load emails, and money emails that must not be taken for them.
+const loadSubjects = [
+  'ALC Load #8646459 - PAYMENT DELAY - LOAD DOCUMENTATION',
+  'Standard Delivery Receipt #0290291',
+  'Re: Standard Delivery Receipt #0290291',
+  'Question related to PO 38634375 - Scale Ticket & Pics Required',
+  'RE: Axle Logistics, LLC Rate Confirmation for 3711257',
+  'TQL PO 39042149 eRate Confirmation',
+  'Carrier Load Tender LD754137 (Load ID)',
+  'Las Vegas, NV to Rocklin, CA 11/3',
+  'Dry Van: WELLAND, ON → VICTORIA, TX | PU TODAY | $2800',
+  'RANCHO CUCAMONGA, CA >> KANSAS CITY MO - VAN 11/02 1200',
+  'Emporia, KS to Laramie, WY Opportunity',
+  'San Diego CA to  NC',
+  'CA-NV',
+  'Invoice for lumper receipt, load 4411',
+  'POD and BOL attached',
+  'Pick-up tomorrow 8am',
+]
+const moneySubjects = [
+  'You just received a payment from eCapital!💰🎉',
+  'Settlement Summary for check date 10/23/2026',
+  'City of Markham, IL Invoice# 73000390002-11052026 Reminder',
+  'Invoice file of customer 5216686 generated for the billing period',
+  'Your eCapital Account Payment History Report',
+  'NM TAP - Payment Submission',
+  'OK to pay invoice NY office',
+  'PAYMENT RECEIVED IN FULL - OK',
+  'Final notice: policy #A-4411 past due',
+  'Download your statement',
+  'P.O. Box change for remittance',
+]
+
+Deno.test('load emails are found by their subject; money subjects are not taken for them', () => {
+  for (const s of loadSubjects) assert.ok(loadMark(s), s)
+  for (const s of moneySubjects) assert.equal(loadMark(s), '', s)
+})
+
+Deno.test('the money list: by company domain, parent domains count, free mail by address', () => {
+  assert.equal(senderEntry('wallet@ecapital.com'), 'ecapital.com')
+  assert.equal(senderEntry('friend@gmail.com'), 'friend@gmail.com')
+  const senders = { 'ecapital.com': 'allowed', 'friend@gmail.com': 'denied' }
+  assert.equal(senderStatus(senders, 'reports@notify.ecapital.com'), 'allowed')
+  assert.equal(senderStatus(senders, 'friend@gmail.com'), 'denied')
+  assert.equal(senderStatus(senders, 'other@gmail.com'), undefined)
+  assert.equal(senderStatus(senders, 'x@notecapital.com'), undefined)
+})
+
+Deno.test('decide: 🔴 and ⭐ always, loads never, money only from allowed senders, a new one asked once', () => {
+  const email = (subject: string, body: string, sender: string) => {
+    const e = readEmail(message())
+    e.subject = subject
+    e.text = body
+    e.from = parseAddress(sender)
+    e.attachments = []
+    return e
+  }
+  const people = [{ entry: 'anna@truckinsure.com', name: 'Anna Lee', note: '' }]
+  const senders: Record<string, string> = { 'ecapital.com': 'allowed', 'broker.com': 'denied', 'nicusa.com': 'asked' }
+  const go = (e: ReturnType<typeof email>) => decide(e, people, [], senders)
+
+  assert.equal(go(email('You just received a payment', 'Hi', 'wallet@ecapital.com')).send, 'chat')
+  const fresh = go(email('Invoice file of customer 5216686', 'Attached.', 'pspbilling@citybilling.com'))
+  assert.deepEqual([fresh.send, fresh.asking, fresh.sender], ['ask', true, 'citybilling.com'])
+  const waiting = go(email('Invoice file of customer 5216687', 'Attached.', 'pspbilling@nicusa.com'))
+  assert.deepEqual([waiting.send, waiting.asking], ['list', true])
+  assert.equal(go(email('Payment for October', 'Hi', 'ar@broker.com')).send, 'list')
+  // A load email stays out even with "payment" and an allowed sender...
+  const load = go(email('ALC Load #8646459 - PAYMENT DELAY', 'Docs missing.', 'info@ecapital.com'))
+  assert.deepEqual([load.send, load.load], ['list', 'Load #8646459'])
+  // ...but urgent insurance and your people come from anyone, loads or not.
+  assert.equal(go(email('Notice of cancellation', 'Your insurance ends Nov 10.', 'x@unknown.com')).send, 'chat')
+  assert.equal(go(email('Load #4411 question', 'Call me', 'anna@truckinsure.com')).send, 'chat')
+  assert.equal(go(email('Lunch?', 'At 1?', 'friend@gmail.com')).send, 'list')
+  // The inbox's own words come, except on load emails.
+  assert.equal(decide(email('Hi Erbol', 'Erbol, call me', 'x@y.com'), [], ['erbol'], {}).send, 'chat')
+  assert.equal(decide(email('Load #12 for Erbol', 'Erbol', 'x@y.com'), [], ['erbol'], {}).send, 'list')
+})
+
 Deno.test('tag: emails tagged by hand or by a Gmail filter, one per conversation, the newest', () => {
   const TAG = 'Label_77'
   const records = [
@@ -309,12 +392,17 @@ Deno.test('buttons: one row when small, more when open; callback data under 64 b
   const id = '18f0a1b2c3d4e5f6a7b8'
   const data = (kb: { inline_keyboard: { callback_data?: string; text: string }[][] }) =>
     kb.inline_keyboard.flat().map((b) => b.callback_data ?? 'url')
-  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'min', 2)), ['v:7:' + id, 'd:7:' + id, 's:7:' + id])
+  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'min', 2)), ['v:7:' + id, 'R:7:' + id, 'd:7:' + id, 's:7:' + id])
   assert.deepEqual(data(emailKeyboard(7, id, 'u', 'more', 2)),
-    ['c:7:' + id, 'f:7:' + id, 'p:7:' + id, 'url', 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
-  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'full', 0)), ['c:7:' + id, 'url', 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+    ['c:7:' + id, 'f:7:' + id, 'p:7:' + id, 'url', 'R:7:' + id, 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'full', 0)),
+    ['c:7:' + id, 'url', 'R:7:' + id, 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+  // A money email from a new sender: ✓ Allow / ✕ Not money on top.
+  const ask = emailKeyboard(7, id, 'u', 'min', 0, 'nicusa.com')
+  assert.deepEqual(data(ask).slice(0, 2), ['G:7:' + id, 'B:7:' + id])
+  assert.equal(ask.inline_keyboard[0][0].text, '✓ Allow nicusa.com')
   const e = readEmail(message({ id }))
-  for (const kb of [emailKeyboard(99999, id, 'u', 'more', 9), stopKeyboard(99999, e)]) {
+  for (const kb of [emailKeyboard(99999, id, 'u', 'more', 9, 'x'.repeat(80)), stopKeyboard(99999, e)]) {
     for (const d of data(kb)) assert.ok(new TextEncoder().encode(d).length <= 64, d)
   }
 })

@@ -4,8 +4,8 @@ import {
   base64urlToBytes,
   buildReply,
   cardText,
-  classify,
   clip,
+  decide,
   decodeEntities,
   describeMute,
   type Email,
@@ -24,6 +24,7 @@ import {
   readableBody,
   readEmail,
   refFromEntities,
+  senderEntry,
   shouldSkip,
   similarWords,
   stopKeyboard,
@@ -39,11 +40,13 @@ import {
  * acts on it from there. Each email is sorted into a template (🔴 urgent
  * insurance, 💰 insurance payment, 🧾 invoice / payment, ⭐ your people) and
  * arrives as a short card: the template, From and To, the subject, the first
- * lines. Emails that fit no template go to the daily list instead, unless the
- * inbox is set to all emails. An email you put the Gmail label "erbol" on
- * (the tag) always comes, whatever the filters. ▾ More shows the rest, 🗑
- * removes it from the chat, 🔕 stops emails like it. Each inbox connects with
- * Google sign-in; nothing is forwarded anywhere.
+ * lines. Load emails never come, and money emails only from senders on the
+ * money list (/senders; a new sender is asked about once). Emails that fit no
+ * template go to the daily list instead, unless the inbox is set to all
+ * emails. An email you put the Gmail label "erbol" on (the tag) always comes,
+ * whatever the filters. ▾ More shows the rest, ↩ Reply answers it, 🗑 removes
+ * it from the chat, 🔕 stops emails like it. Each inbox connects with Google
+ * sign-in; nothing is forwarded anywhere.
  *
  * Routes. verify_jwt is off because Telegram and Google call in without a
  * Supabase JWT, so every route checks its own secret:
@@ -99,6 +102,7 @@ const HELP = [
   '/unread: latest unread emails',
   '/templates: what 🔴 💰 🧾 ⭐ look for',
   '/people: your ⭐ people, their emails always come through',
+  '/senders: who may send you money emails (✓ Allow on a new sender adds them)',
   '📌 Put the Gmail label "erbol" on any email and it comes here, whatever the filters.',
   '/filter: per inbox: templates only, extra words, or all emails',
   '/skipped: emails that fit no template (the daily list)',
@@ -107,8 +111,9 @@ const HELP = [
   '/pause, /resume: stop or restart notifications',
   '/status: is everything working',
   '',
-  'On an email: ▾ More shows the rest, 🗑 removes it from this chat (it stays in Gmail), 🔕 stops emails like it.',
-  'To answer an email, use Telegram\'s Reply on it and type your answer. I show you the reply before it goes out.',
+  'On an email: ▾ More shows the rest, ↩ Reply answers it, 🗑 removes it from this chat (it stays in Gmail), ' +
+  '🔕 stops emails like it.',
+  'Replies: tap ↩ Reply (or swipe the email) and type your answer. I show you the reply before it goes out.',
 ].join('\n')
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } })
@@ -138,6 +143,8 @@ interface Ctx {
   tz: string
   muted: string[]
   people: Person[]
+  /** The money list: sender entry → allowed, asked or denied. */
+  senders: Record<string, string>
   /** The Gmail label name that sends an email here whatever the filters. */
   tag: string
 }
@@ -205,14 +212,16 @@ async function loadMuted(): Promise<string[]> {
 }
 
 async function loadCtx(cfg: Config): Promise<Ctx> {
-  const [muted, { data: people }] = await Promise.all([
+  const [muted, { data: people }, { data: senders }] = await Promise.all([
     loadMuted(),
     db.from('mailbot_people').select('entry, name, note'),
+    db.from('mailbot_senders').select('entry, status'),
   ])
   return {
     tz: cfg.time_zone || DEFAULT_TIME_ZONE,
     muted,
     people: (people ?? []) as Person[],
+    senders: Object.fromEntries((senders ?? []).map((s) => [s.entry, s.status])),
     tag: cfg.tag_label || DEFAULT_TAG,
   }
 }
@@ -571,7 +580,8 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
   if (isMuted(ctx.muted, email.from.email, email.subject)) return false
-  if (ib.mode !== 'all' && classify(email, ctx.people, ib.keywords).kind === 'none') {
+  const d = decide(email, ctx.people, ib.keywords, ctx.senders)
+  if (ib.mode !== 'all' && d.send === 'list') {
     // Held back, not lost: the daily digest and /skipped list these.
     await db.from('mailbot_skipped').upsert({
       inbox_id: ib.id,
@@ -582,45 +592,57 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
     })
     return false
   }
+  if (d.send === 'ask') {
+    // Asked once: until the answer, this sender's next money emails go to the daily list.
+    ctx.senders[d.sender] = 'asked'
+    await db.from('mailbot_senders').upsert({ entry: d.sender, status: 'asked' }, {
+      onConflict: 'entry',
+      ignoreDuplicates: true,
+    })
+  }
   await postCard(ib, email, chat, ctx, 'min')
   return true
 }
 
 // ------------------------------------------------------------------ cards --
 
-function cardFor(ib: Inbox, email: Email, ctx: Ctx, view: View): string {
-  const { label, tags } = classify(email, ctx.people, ib.keywords)
+/** A card's text and buttons. A money email from a sender with no answer yet carries ✓ Allow / ✕ Not money. */
+function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View): { text: string; markup: { inline_keyboard: Button[][] } } {
+  const d = decide(email, ctx.people, ib.keywords, ctx.senders)
   const isTagged = Boolean(ib.tag_label_id) && email.labelIds.includes(ib.tag_label_id!)
+  const label = (isTagged ? '📌 ' + ctx.tag + (d.label ? ' · ' : '') : '') + d.label + (d.asking ? ' · 🆕 new sender' : '')
+  const link = gmailLink(ib.email, email.id)
   const base = {
-    label: isTagged ? '📌 ' + ctx.tag + (label ? ' · ' + label : '') : label,
+    label,
     email,
     inbox: { email: ib.email, name: inboxName(ib.label, ib.email, email) },
-    link: gmailLink(ib.email, email.id),
+    link,
     timeZone: ctx.tz,
   }
-  if (view === 'min') return cardText({ ...base, body: preview(email, CARD_CHARS) })
-  if (view === 'more') {
-    return cardText({ ...base, details: true, tags, body: clip(readableBody(email, true), PREVIEW_CHARS) })
+  let text
+  if (view === 'min') text = cardText({ ...base, body: preview(email, CARD_CHARS) })
+  else if (view === 'more') {
+    text = cardText({ ...base, details: true, tags: d.tags, body: clip(readableBody(email, true), PREVIEW_CHARS) })
+  } else {
+    const full = readableBody(email, false)
+    const body = full.length > FULL_CHARS ? clip(full, FULL_CHARS) + '\n\n(the rest is in Gmail: ↗ Gmail)' : full
+    text = cardText({ ...base, details: true, tags: d.tags, body })
   }
-  const full = readableBody(email, false)
-  const body = full.length > FULL_CHARS ? clip(full, FULL_CHARS) + '\n\n(the rest is in Gmail: ↗ Gmail)' : full
-  return cardText({ ...base, details: true, tags, body })
-}
-
-function cardButtons(ib: Inbox, email: Email, view: View): { inline_keyboard: Button[][] } {
-  return emailKeyboard(ib.id, email.id, gmailLink(ib.email, email.id), view,
-    Math.min(email.attachments.length, MAX_ATTACHMENTS))
+  const files = Math.min(email.attachments.length, MAX_ATTACHMENTS)
+  return { text, markup: emailKeyboard(ib.id, email.id, link, view, files, d.asking ? d.sender : '') }
 }
 
 async function postCard(ib: Inbox, email: Email, chat: string, ctx: Ctx, view: View): Promise<void> {
-  const res = await send(chat, cardFor(ib, email, ctx, view), cardButtons(ib, email, view))
+  const card = renderCard(ib, email, ctx, view)
+  const res = await send(chat, card.text, card.markup)
   if (!res.ok) throw new TelegramError(res)
 }
 
 // deno-lint-ignore no-explicit-any
 async function showCard(q: any, ib: Inbox, id: string, view: View, cfg: Config): Promise<void> {
   const [email, ctx] = await Promise.all([fetchEmail(ib, id), loadCtx(cfg)])
-  await edit(q.message.chat.id, q.message.message_id, cardFor(ib, email, ctx, view), cardButtons(ib, email, view))
+  const card = renderCard(ib, email, ctx, view)
+  await edit(q.message.chat.id, q.message.message_id, card.text, card.markup)
 }
 
 /** 📎: the files of one email, each as a document with its own 🗑. */
@@ -714,6 +736,11 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdTemplates(chat)
     case '/people':
       return await cmdPeople(chat, arg)
+    case '/senders': {
+      const list = await sendersList()
+      await send(chat, list.text, list.markup)
+      return
+    }
     case '/skipped':
       return await sendDigest(cfg, chat, false)
     case '/check': {
@@ -821,7 +848,7 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
       ))
       return msgs.map((m) => ({ ib, email: readEmail(m) }))
         .filter((x) => !isMuted(ctx.muted, x.email.from.email, x.email.subject) &&
-          (ib.mode === 'all' || classify(x.email, ctx.people, ib.keywords).kind !== 'none'))
+          (ib.mode === 'all' || decide(x.email, ctx.people, ib.keywords, ctx.senders).send !== 'list'))
     } catch (e) {
       console.error('unread', ib.email, e)
       return []
@@ -929,6 +956,29 @@ async function peopleList(): Promise<{ text: string; markup: { inline_keyboard: 
   }
 }
 
+/** /senders: the money list. Tapping one forgets it, so their next money email asks again. */
+async function sendersList(): Promise<{ text: string; markup: { inline_keyboard: Button[][] } }> {
+  const { data, error } = await db.from('mailbot_senders').select('id, entry, status').order('created_at')
+  if (error) throw new Error('senders: ' + error.message)
+  const all = data ?? []
+  const group = (status: string, title: string) => {
+    const entries = all.filter((s) => s.status === status).map((s) => esc(s.entry))
+    return entries.length ? [title + ' ' + entries.join(', ')] : []
+  }
+  const text = [
+    '💵 <b>Money emails</b> (🧾 💰) come only from these senders:',
+    '',
+    ...group('allowed', '✅'),
+    ...group('asked', '⏳ Asked, no answer yet:'),
+    ...group('denied', '✕ Not money:'),
+    ...(all.length ? [] : ['Nobody yet.']),
+    '',
+    'A new sender comes once, with ✓ Allow. Tap a name below to forget it.',
+  ].join('\n')
+  const rows = all.slice(0, 50).map((s) => [{ text: '✖ ' + clip(s.entry, 50), callback_data: 'L:' + s.id }])
+  return { text, markup: { inline_keyboard: [...rows, [{ text: '🗑', callback_data: 'X' }]] } }
+}
+
 /** /templates: what each template looks for, straight from the word lists. */
 async function cmdTemplates(chat: string): Promise<void> {
   const words = (list: string[]) => esc(list.map((w) => w.replace(/\*$/, '')).join(', '))
@@ -946,6 +996,10 @@ async function cmdTemplates(chat: string): Promise<void> {
     '',
     'Words count in the subject, the sender, file names and the first lines of the newest message. ' +
     'Signatures, footers and old replies don\'t count. Emails that fit no template go to the daily list (/skipped).',
+    '',
+    '🚚 Load emails never come, even with money words: load #, PO, rate confirmation, delivery receipt, BOL, POD, ' +
+    'tender, pickup, lanes like "NV to Rocklin, CA".',
+    '💵 🧾 and 💰 come only from senders you allowed (/senders). 🔴, ⭐ and 📌 always come.',
   ].join('\n'), TRASH)
 }
 
@@ -998,6 +1052,11 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
         .maybeSingle()
       if (gone) toast = 'Removed ' + (gone.name || gone.entry)
       const list = await peopleList()
+      await edit(chat, messageId, list.text, list.markup)
+    } else if (act === 'L') {
+      const { data: gone } = await db.from('mailbot_senders').delete().eq('id', Number(a)).select('entry').maybeSingle()
+      if (gone) toast = 'Forgot ' + gone.entry + '. Their next money email asks again.'
+      const list = await sendersList()
       await edit(chat, messageId, list.text, list.markup)
     } else if (act === 'y' || act === 'Y') {
       toast = await sendPendingReply(q, a, act === 'Y')
@@ -1066,8 +1125,32 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
       const email = await fetchEmail(ib, id)
       const entry = muteEntry(email, kind ?? 's')
       if (entry) await db.from('mailbot_muted').delete().eq('entry', entry)
-      await edit(chat, messageId, cardFor(ib, email, await loadCtx(cfg), 'min'), cardButtons(ib, email, 'min'))
+      const card = renderCard(ib, email, await loadCtx(cfg), 'min')
+      await edit(chat, messageId, card.text, card.markup)
       return 'Back on'
+    }
+    case 'G':
+    case 'B': {
+      // ✓ Allow / ✕ Not money: the answer for this sender's company (or address, for free mail).
+      const email = await fetchEmail(ib, id)
+      const entry = senderEntry(email.from.email)
+      await db.from('mailbot_senders').upsert({ entry, status: act === 'G' ? 'allowed' : 'denied' }, { onConflict: 'entry' })
+      if (act === 'B') {
+        await remove(chat, messageId)
+        return entry + ': money emails go to the daily list. /senders to change it.'
+      }
+      const card = renderCard(ib, email, await loadCtx(cfg), 'min')
+      await edit(chat, messageId, card.text, card.markup)
+      return '✓ ' + entry + ' allowed: their money emails come here now.'
+    }
+    case 'R': {
+      // The prompt carries the email's Gmail link, so the answer typed under it finds the email.
+      const email = readEmail(await gmail(ib, `messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`))
+      await send(chat, '↩️ <b>Reply to ' + esc(email.from.label) + '</b>\n' +
+        'Re: <a href="' + esc(gmailLink(ib.email, email.id)) + '">' + esc(clip(email.subject || '(no subject)', 200)) +
+        '</a>\n\nType your answer below. You\'ll see it before it goes out.',
+        { force_reply: true, input_field_placeholder: 'Your reply…' }, messageId)
+      return ''
     }
     case 'o':
       await postCard(ib, await fetchEmail(ib, id), chat, await loadCtx(cfg), 'more')
@@ -1265,6 +1348,11 @@ async function onReply(chat: string, m: any, text: string): Promise<void> {
   if (all.cc.length) buttons.push({ text: '👥 Reply all', callback_data: 'Y:' + key })
   buttons.push({ text: '✖ Cancel', callback_data: 'n:' + key })
   await send(chat, lines.join('\n'), { inline_keyboard: [buttons] }, m.message_id)
+  // The "↩️ Reply to …" prompt has done its job; the confirmation shows what was typed.
+  const prompt = m.reply_to_message
+  if (prompt.from?.is_bot && String(prompt.text ?? '').startsWith('↩️ Reply to')) {
+    await tg('deleteMessage', { chat_id: chat, message_id: prompt.message_id })
+  }
 }
 
 /** After Send or Cancel, the typed reply and the confirmation leave the chat. */
