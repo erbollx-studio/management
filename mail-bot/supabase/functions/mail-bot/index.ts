@@ -12,11 +12,14 @@ import {
   emailKeyboard,
   esc,
   fmtDate,
+  fmtWhen,
   gmailLink,
   inboxName,
   INSURANCE_WORDS,
   isMuted,
   isQuiet,
+  laterKeyboard,
+  laterTime,
   MONEY_WORDS,
   muteEntry,
   parseQuiet,
@@ -115,8 +118,8 @@ const HELP = [
   '/pause, /resume: stop or restart notifications',
   '/status: is everything working',
   '',
-  'On an email: ▾ More shows the rest, ↩ Reply answers it, 🗑 removes it from this chat (it stays in Gmail), ' +
-  '🔕 stops emails like it.',
+  'On an email: ▾ More shows the rest, ↩ Reply answers it, ⏰ brings it back later, 🗑 removes it from this chat ' +
+  '(it stays in Gmail), 🔕 stops emails like it.',
   'Replies: tap ↩ Reply (or swipe the email) and type your answer. I show you the reply before it goes out.',
 ].join('\n')
 
@@ -140,6 +143,18 @@ interface Inbox {
   /** The Gmail label id of the tag ("erbol") in this inbox, and when it was last looked up. */
   tag_label_id: string | null
   tag_checked_at: string | null
+}
+
+/** A row of mailbot_reminders: something to send at `due_at`. */
+interface Reminder {
+  id: number
+  kind: 'later' | 'deadline' | 'unanswered'
+  inbox_id: number
+  message_id: string
+  thread_id: string
+  due_at: string
+  note: string
+  tries: number
 }
 
 /** What sorting emails and drawing cards needs besides the email itself. */
@@ -622,11 +637,15 @@ interface Card {
   urgent: boolean
 }
 
-/** A card's text and buttons. A money email from a sender with no answer yet carries ✓ Allow / ✕ Not money. */
-function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View): Card {
+/**
+ * A card's text and buttons. A money email from a sender with no answer yet
+ * carries ✓ Allow / ✕ Not money. `prefix` leads the top line ("⏰ Reminder").
+ */
+function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View, prefix = ''): Card {
   const d = decide(email, ctx.people, ib.keywords, ctx.senders)
   const isTagged = Boolean(ib.tag_label_id) && email.labelIds.includes(ib.tag_label_id!)
-  const label = (isTagged ? '📌 ' + ctx.tag + (d.label ? ' · ' : '') : '') + d.label + (d.asking ? ' · 🆕 new sender' : '')
+  const label = [prefix, isTagged ? '📌 ' + ctx.tag : '', d.label, d.asking ? '🆕 new sender' : '']
+    .filter(Boolean).join(' · ')
   const link = gmailLink(ib.email, email.id)
   const base = {
     label,
@@ -653,8 +672,8 @@ function renderCard(ib: Inbox, email: Email, ctx: Ctx, view: View): Card {
 }
 
 /** Posts a card; in the quiet hours it arrives without sound, unless it's 🔴 urgent. */
-async function postCard(ib: Inbox, email: Email, chat: string, ctx: Ctx, view: View): Promise<void> {
-  const card = renderCard(ib, email, ctx, view)
+async function postCard(ib: Inbox, email: Email, chat: string, ctx: Ctx, view: View, prefix = ''): Promise<void> {
+  const card = renderCard(ib, email, ctx, view, prefix)
   const silent = !card.urgent && isQuiet(new Date(), ctx.tz, ctx.quiet)
   const res = await send(chat, card.text, card.markup, undefined, silent)
   if (!res.ok) throw new TelegramError(res)
@@ -1198,8 +1217,68 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
     case 'o':
       await postCard(ib, await fetchEmail(ib, id), chat, await loadCtx(cfg), 'more')
       return ''
+    case 'T':
+      await tg('editMessageReplyMarkup', {
+        chat_id: chat,
+        message_id: messageId,
+        reply_markup: laterKeyboard(ib.id, id, new Date(), cfg.time_zone || DEFAULT_TIME_ZONE),
+      })
+      return ''
+    case 'W': {
+      // ⏰: the card leaves the chat and comes back at the chosen time.
+      const tz = cfg.time_zone || DEFAULT_TIME_ZONE
+      const now = new Date()
+      const due = laterTime(kind ?? 'h', now, tz)
+      const m = await gmail(ib, `messages/${id}?format=minimal`)
+      const { error } = await db.from('mailbot_reminders').insert({
+        kind: 'later',
+        inbox_id: ib.id,
+        message_id: id,
+        thread_id: m.threadId,
+        due_at: due.toISOString(),
+      })
+      if (error) throw new Error('reminder: ' + error.message)
+      await remove(chat, messageId)
+      return '⏰ It comes back ' + fmtWhen(due, now, tz) + '.'
+    }
   }
   return ''
+}
+
+// -------------------------------------------------------------- reminders --
+
+/**
+ * Sends the reminders that are due: ⏰ cards come back. Each is claimed by
+ * deleting its row first, so overlapping runs never send it twice. A failure
+ * puts it back for another try in 10 minutes, up to 3 times; an email that is
+ * gone from Gmail just drops its reminder.
+ */
+async function runReminders(cfg: Config): Promise<void> {
+  const chat = cfg.owner_chat_id
+  const { data, error } = await db.from('mailbot_reminders').select('*').lte('due_at', new Date().toISOString())
+    .order('due_at').limit(20)
+  if (error) throw new Error('reminders: ' + error.message)
+  if (!data?.length) return
+  const ctx = await loadCtx(cfg)
+  for (const r of data as Reminder[]) {
+    const { data: mine } = await db.from('mailbot_reminders').delete().eq('id', r.id).select('id').maybeSingle()
+    if (!mine) continue
+    try {
+      const ib = await inboxById(r.inbox_id)
+      if (r.kind === 'later') await postCard(ib, await fetchEmail(ib, r.message_id), chat, ctx, 'min', '⏰ Reminder')
+    } catch (e) {
+      if (e instanceof GmailError && e.status === 404) continue
+      console.error('reminder', r.id, e)
+      if (r.tries < 3) {
+        const { id: _id, ...again } = r
+        await db.from('mailbot_reminders').insert({
+          ...again,
+          tries: r.tries + 1,
+          due_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+        })
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------- filters --
@@ -1530,8 +1609,22 @@ async function handleCron(req: Request): Promise<Response> {
   if (!cfg.owner_chat_id || cfg.paused === 'true') return json({ skipped: true })
   const job = ((await req.json().catch(() => ({}))) as { job?: string }).job
   if (job === 'digest') background(sendDigest(cfg, cfg.owner_chat_id, true).catch((e) => console.error('digest', e)))
-  else background(pollAll(cfg).catch((e) => console.error('cron', e)))
+  else background(tick(cfg))
   return json({ ok: true })
+}
+
+/** The once-a-minute work: new mail first, then reminders. A failure in one never stops the other. */
+async function tick(cfg: Config): Promise<void> {
+  try {
+    await pollAll(cfg)
+  } catch (e) {
+    console.error('cron', e)
+  }
+  try {
+    await runReminders(cfg)
+  } catch (e) {
+    console.error('reminders', e)
+  }
 }
 
 /** Public and deliberately boring: counts and ages only, no addresses. */

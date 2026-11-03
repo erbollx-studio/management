@@ -70,7 +70,7 @@ From: Anna Lee · anna@truckinsure.com
 To: Dan Cargo · info@dancargologisticsinc.com
 Subject: Final notice: policy #A-4411 past due
 Your premium of $1,850 was due Oct 30. Coverage will be cancelled on …
-[▾ More] [↩ Reply] [🗑 Delete] [🔕 Stop]
+[▾ More] [↩ Reply] [⏰] [🗑] [🔕]
 ```
 
 The subject links to the email in Gmail. The inbox name comes from Gmail.
@@ -79,6 +79,10 @@ The subject links to the email in Gmail. The inbox name comes from Gmail.
   chose the template, and more of the text. **▴ Less** folds it back.
 - **📄 Full text** shows the whole text (long emails are cut; the rest is in Gmail).
 - **📎 N** sends the email's files. Files never come on their own.
+- **⏰** brings it back later: in 1 hour, tonight at 19:00 (offered before
+  18:00) or tomorrow at 9:00. The card leaves the chat and comes back marked
+  `⏰ Reminder`. Reminders live in `mailbot_reminders` and are sent by the
+  once-a-minute run, right after the mail check.
 - **🗄 Archive** archives it in Gmail and removes it from the chat.
 - **🗑 Delete** removes it from the chat and marks it read in Gmail. The email
   stays in Gmail.

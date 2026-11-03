@@ -663,6 +663,25 @@ export function isQuiet(now: Date, tz: string, quiet: { from: number; to: number
   return quiet.from > quiet.to ? h >= quiet.from || h < quiet.to : h >= quiet.from && h < quiet.to
 }
 
+/** When a ⏰ card comes back: h = in an hour, e = tonight at 19:00, m = tomorrow at 9:00. */
+export function laterTime(choice: string, now: Date, tz: string): Date {
+  const t = localParts(now, tz)
+  if (choice === 'e') return atLocal(tz, t.y, t.m, t.d, 19)
+  if (choice === 'm') return atLocal(tz, t.y, t.m, t.d + 1, 9)
+  return new Date(now.getTime() + 60 * 60_000)
+}
+
+/** "today at 19:00", "tomorrow at 9:00", or the date, for telling when something comes back. */
+export function fmtWhen(due: Date, now: Date, tz: string): string {
+  const d = localParts(due, tz)
+  const t = localParts(now, tz)
+  const tomorrow = localParts(atLocal(tz, t.y, t.m, t.d + 1, 12), tz)
+  const at = d.h + ':' + String(d.min).padStart(2, '0')
+  if (d.y === t.y && d.m === t.m && d.d === t.d) return 'today at ' + at
+  if (d.y === tomorrow.y && d.m === tomorrow.m && d.d === tomorrow.d) return 'tomorrow at ' + at
+  return fmtDate(due, tz)
+}
+
 // -------------------------------------------------------------- telegram --
 
 export function esc(s: string): string {
@@ -768,18 +787,32 @@ export function emailKeyboard(
     ? [[{ text: '✓ Allow ' + clip(ask, 28), callback_data: 'G:' + ref }, { text: '✕ Not money', callback_data: 'B:' + ref }]]
     : []
   const reply: Button = { text: '↩ Reply', callback_data: 'R:' + ref }
+  const later: Button = { text: '⏰', callback_data: 'T:' + ref }
   const done: Button[] = [
-    { text: '🗑 Delete', callback_data: 'd:' + ref },
-    { text: '🔕 Stop', callback_data: 's:' + ref },
+    { text: '🗑', callback_data: 'd:' + ref },
+    { text: '🔕', callback_data: 's:' + ref },
   ]
   if (view === 'min') {
-    return { inline_keyboard: [...asking, [{ text: '▾ More', callback_data: 'v:' + ref }, reply, ...done]] }
+    return { inline_keyboard: [...asking, [{ text: '▾ More', callback_data: 'v:' + ref }, reply, later, ...done]] }
   }
   const top: Button[] = [{ text: '▴ Less', callback_data: 'c:' + ref }]
   if (view === 'more') top.push({ text: '📄 Full text', callback_data: 'f:' + ref })
   if (files) top.push({ text: '📎 ' + files, callback_data: 'p:' + ref })
   top.push({ text: '↗ Gmail', url: link })
-  return { inline_keyboard: [...asking, top, [reply, { text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
+  return { inline_keyboard: [...asking, top, [reply, later, { text: '🗄 Archive', callback_data: 'a:' + ref }, ...done]] }
+}
+
+/** The ⏰ choices for a card. "Tonight" is offered only before 18:00. */
+export function laterKeyboard(inboxId: number, id: string, now: Date, tz: string): { inline_keyboard: Button[][] } {
+  const ref = inboxId + ':' + id
+  return {
+    inline_keyboard: [
+      [{ text: '⏰ In 1 hour', callback_data: 'W:' + ref + ':h' }],
+      ...(localParts(now, tz).h < 18 ? [[{ text: '🌙 Tonight 19:00', callback_data: 'W:' + ref + ':e' }]] : []),
+      [{ text: '☀️ Tomorrow 9:00', callback_data: 'W:' + ref + ':m' }],
+      [{ text: '‹ Back', callback_data: 'c:' + ref }],
+    ],
+  }
 }
 
 /** The 🔕 choices for one email. The company choice is left out for free mail providers. */

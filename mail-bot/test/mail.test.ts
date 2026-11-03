@@ -29,7 +29,10 @@ import {
   shouldSkip,
   similarWords,
   atLocal,
+  fmtWhen,
   isQuiet,
+  laterKeyboard,
+  laterTime,
   loadMark,
   localParts,
   parseQuiet,
@@ -375,6 +378,20 @@ Deno.test('quiet hours: 22-7 runs past midnight; off and nonsense mean never', (
   assert.equal(isQuiet(at(23), tz, null), false)
 })
 
+Deno.test('⏰ later: in an hour, tonight at 19:00, tomorrow at 9:00; "tonight" only before 18:00', () => {
+  const tz = 'Asia/Bishkek'
+  const now = atLocal(tz, 2026, 11, 30, 15, 20)
+  assert.equal(laterTime('h', now, tz).getTime() - now.getTime(), 60 * 60_000)
+  assert.equal(laterTime('e', now, tz).toISOString(), atLocal(tz, 2026, 11, 30, 19).toISOString())
+  assert.equal(laterTime('m', now, tz).toISOString(), atLocal(tz, 2026, 12, 1, 9).toISOString()) // next month
+  assert.equal(fmtWhen(laterTime('e', now, tz), now, tz), 'today at 19:00')
+  assert.equal(fmtWhen(laterTime('m', now, tz), now, tz), 'tomorrow at 9:00')
+  assert.equal(fmtWhen(laterTime('h', now, tz), now, tz), 'today at 16:20')
+  const choices = (at: Date) => laterKeyboard(1, 'abc', at, tz).inline_keyboard.map((r) => r[0].callback_data)
+  assert.deepEqual(choices(now), ['W:1:abc:h', 'W:1:abc:e', 'W:1:abc:m', 'c:1:abc'])
+  assert.deepEqual(choices(atLocal(tz, 2026, 11, 30, 18, 30)), ['W:1:abc:h', 'W:1:abc:m', 'c:1:abc'])
+})
+
 Deno.test('tag: emails tagged by hand or by a Gmail filter, one per conversation, the newest', () => {
   const TAG = 'Label_77'
   const records = [
@@ -420,17 +437,20 @@ Deno.test('buttons: one row when small, more when open; callback data under 64 b
   const id = '18f0a1b2c3d4e5f6a7b8'
   const data = (kb: { inline_keyboard: { callback_data?: string; text: string }[][] }) =>
     kb.inline_keyboard.flat().map((b) => b.callback_data ?? 'url')
-  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'min', 2)), ['v:7:' + id, 'R:7:' + id, 'd:7:' + id, 's:7:' + id])
+  assert.deepEqual(data(emailKeyboard(7, id, 'u', 'min', 2)),
+    ['v:7:' + id, 'R:7:' + id, 'T:7:' + id, 'd:7:' + id, 's:7:' + id])
   assert.deepEqual(data(emailKeyboard(7, id, 'u', 'more', 2)),
-    ['c:7:' + id, 'f:7:' + id, 'p:7:' + id, 'url', 'R:7:' + id, 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+    ['c:7:' + id, 'f:7:' + id, 'p:7:' + id, 'url', 'R:7:' + id, 'T:7:' + id, 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
   assert.deepEqual(data(emailKeyboard(7, id, 'u', 'full', 0)),
-    ['c:7:' + id, 'url', 'R:7:' + id, 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
+    ['c:7:' + id, 'url', 'R:7:' + id, 'T:7:' + id, 'a:7:' + id, 'd:7:' + id, 's:7:' + id])
   // A money email from a new sender: ✓ Allow / ✕ Not money on top.
   const ask = emailKeyboard(7, id, 'u', 'min', 0, 'nicusa.com')
   assert.deepEqual(data(ask).slice(0, 2), ['G:7:' + id, 'B:7:' + id])
   assert.equal(ask.inline_keyboard[0][0].text, '✓ Allow nicusa.com')
   const e = readEmail(message({ id }))
-  for (const kb of [emailKeyboard(99999, id, 'u', 'more', 9, 'x'.repeat(80)), stopKeyboard(99999, e)]) {
+  const kbs = [emailKeyboard(99999, id, 'u', 'more', 9, 'x'.repeat(80)), stopKeyboard(99999, e),
+    laterKeyboard(99999, id, new Date(), 'Asia/Bishkek')]
+  for (const kb of kbs) {
     for (const d of data(kb)) assert.ok(new TextEncoder().encode(d).length <= 64, d)
   }
 })
