@@ -124,9 +124,10 @@ The subject links to the email in Gmail. The inbox name comes from Gmail.
   this one" (same sender, same subject apart from numbers and dates).
 - **↩ Reply**: tap it (or use Telegram's own Reply on the email) and type.
   The bot shows you the reply first and sends it only after **✅ Send** (or
-  **👥 Reply all**). It goes out from the inbox the email came to, in the same
-  Gmail conversation. Afterwards the prompt, your typed text and the
-  confirmation leave the chat. Text only.
+  **👥 Reply all**); **✨ Polish** can rewrite it first (see below). It goes
+  out from the inbox the email came to, in the same Gmail conversation.
+  Afterwards the prompt, your typed text and the confirmation leave the chat.
+  Text only.
 
 Other bot messages (files, lists, confirmations) have a 🗑 button too, so the
 chat stays clean. Emails in the Promotions and Social tabs are skipped.
@@ -156,6 +157,46 @@ chat). When several come back at once, only the first one rings.
 **Quiet hours** (`/quiet`, 22:00–7:00 at first): cards still arrive, but
 without sound or vibration. Only 🔴 urgent insurance rings. `/quiet 23-6`
 changes the hours, `/quiet off` turns them off.
+
+## ✍️ New email and ✨ Polish
+
+**✍️ New email.** Send `/new`. The bot asks which inbox sends it (one button
+per inbox), then who it's to (one or more addresses, with commas), the
+subject and the text. Answer each question with Telegram's Reply (the bot
+opens it for you). Then you see the email: From, To, Subject and the text,
+with **✨ Polish**, **✅ Send** and **✕ Cancel**. ✅ Send sends it from that
+inbox as plain text. Afterwards the questions and your answers leave the
+chat, and a short `✅ Sent from info@…` stays, with 🗑. A typo in an address
+is caught: the bot asks again. A new `/new` drops a half-written one. Drafts
+live in `mailbot_drafts` and are dropped after a day.
+
+**✨ Polish** is on a new email and on a reply (next to ✅ Send). It rewrites
+your text with AI so it is clear, polite, professional and short, in the same
+language, with the same names, numbers, dates and load numbers. You see the
+new text first, with **✅ Send**, **↩ Use mine** (back to your own text) and
+**✕ Cancel**. Nothing is sent until you tap ✅ Send.
+
+- **Numbers are checked.** AI can change a number by mistake, so the bot
+  compares the numbers, amounts, dates, times and phones in your text and in
+  the new one. If any differ, the preview says so above the buttons:
+  `⚠️ Check these: $1,850 → $1,580`. "$1,850", "1850" and "1,850.00" count as
+  the same amount, "11/13" and "Nov 13" as the same date (`numbersChanged` in
+  `mail.ts`).
+- **The AI** is the free model `openai/gpt-oss-120b` on **Groq**. If Groq
+  doesn't answer (20 seconds), is busy or down, the bot tries the same model on
+  **Cloudflare Workers AI**, if you set it up. If neither works, a message
+  says why and your text stays as it was.
+- **Keys.** Make a free key at [console.groq.com](https://console.groq.com)
+  (no card) and send `/aikey groq <key>`. Backup, if you want one:
+  `/aikey cloudflare <account_id> <token>` (a Workers AI token from the
+  Cloudflare dashboard). The bot deletes your message with the key right away
+  and keeps the key in Supabase Vault. `/aikey` shows which keys are set,
+  never the keys.
+- **When Groq retires the model**, Polish says "the model was retired". Put
+  the new name in `mailbot_config`:
+  `insert into mailbot_config (key, value) values ('ai_model', '<new model>')
+  on conflict (key) do update set value = excluded.value;`
+  (`ai_model_cloudflare` does the same for the backup.)
 
 ## Extra words per inbox
 
@@ -188,6 +229,9 @@ On top of the templates, an inbox can let through emails with its own words.
 | `/muted` | What you stopped with 🔕; tap one to undo |
 | `/check` | Check all inboxes now |
 | `/quiet`, `/quiet 23-6`, `/quiet off` | Night hours without sound (🔴 still rings) |
+| `/new` | Write a new email from one of your inboxes |
+| `/aikey` | Which AI keys for ✨ Polish are set |
+| `/aikey groq <key>`, `/aikey cloudflare <account_id> <token>` | Save an AI key (your message is deleted at once) |
 | `/pause`, `/resume` | Stop or restart notifications |
 | `/status` | Is everything working |
 
@@ -210,8 +254,8 @@ It uses the Google sign-in app the calendar sync already has
 2. This address in the OAuth client's **Authorized redirect URIs**:
    `https://vqexlrqphddnnbveppbl.supabase.co/functions/v1/mail-bot/callback`
 
-No secrets are in this repo. The bot token and the Google tokens are in
-Supabase Vault (encrypted storage). The Telegram secret, the schedule key and
+No secrets are in this repo. The bot token, the Google tokens and the AI keys
+are in Supabase Vault (encrypted storage). The Telegram secret, the schedule key and
 the pairing code are made by the migration and kept in `mailbot_config`.
 
 Health check (no private data): `GET …/functions/v1/mail-bot/health`
@@ -243,4 +287,4 @@ deno test mail-bot/test/
 - Telegram lets bots delete messages for 48 hours. After that, 🗑 shrinks the
   message to "✓" instead.
 - Files over 20 MB get a Gmail link instead.
-- Replies are plain text.
+- Replies and new emails are plain text, without files.

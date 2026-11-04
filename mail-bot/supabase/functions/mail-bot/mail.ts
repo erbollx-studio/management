@@ -1137,3 +1137,337 @@ export function buildReply(email: Email, self: string, text: string, all: boolea
   const message = headers.join('\r\n') + '\r\n\r\n' + body
   return { raw: bytesToBase64url(new TextEncoder().encode(message)), to, cc }
 }
+
+// ------------------------------------------------------------- new email --
+
+/** A typed address that can go in a To line: something@domain.tld, nothing else. */
+const EMAIL_ADDRESS = /^[^\s@<>()[\]\\,;:"]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/i
+
+/**
+ * The addresses typed for a new email. Commas, semicolons, spaces or new
+ * lines may sit between them, and "Anna Lee <anna@x.com>" works too. `bad`
+ * holds what doesn't look like an address, so the bot can ask again instead
+ * of sending to a typo.
+ */
+export function parseRecipients(input: string): { ok: string[]; bad: string[] } {
+  const ok: string[] = []
+  const bad: string[] = []
+  for (const item of parseAddressList(input.replace(/[;\n]+/g, ','))) {
+    const words = item.email.split(/\s+/).map((w) => w.replace(/^mailto:/, '').replace(/^[<(]+|[>).]+$/g, ''))
+    // "Anna anna@x.com": a name typed before the address, without the < >.
+    const withAt = words.filter((w) => w.includes('@'))
+    for (const w of withAt.length ? withAt : words) {
+      if (!EMAIL_ADDRESS.test(w)) bad.push(w)
+      else if (!ok.includes(w)) ok.push(w)
+    }
+  }
+  return { ok, bad }
+}
+
+/**
+ * Header text with non-ASCII letters, as RFC 2047 words, one per folded line,
+ * each short enough that "Subject: " and the word fit in 76 characters. One
+ * long word breaks the rules, and some mail programs then show it raw.
+ */
+export function encodeHeader(s: string): string {
+  if (/^[\x20-\x7e]*$/.test(s)) return s
+  const enc = new TextEncoder()
+  const chunks: string[] = []
+  let chunk = ''
+  for (const ch of s) {
+    // 39 bytes are 52 base64 letters, 64 with =?UTF-8?B? and ?=.
+    if (chunk && enc.encode(chunk + ch).length > 39) {
+      chunks.push(chunk)
+      chunk = ''
+    }
+    chunk += ch
+  }
+  if (chunk) chunks.push(chunk)
+  return chunks.map((c) => '=?UTF-8?B?' + bytesToBase64(enc.encode(c)) + '?=').join('\r\n ')
+}
+
+/** "Dan Cargo <info@x.com>": the name quoted or encoded when it needs it; just the address without a name. */
+function formatAddress(name: string, email: string): string {
+  const n = name.replace(/[\r\n]+/g, ' ').trim()
+  if (!n) return email
+  if (!/^[\x20-\x7e]*$/.test(n)) return encodeHeader(n) + ' <' + email + '>'
+  if (/^[\w !#$%&'*+/=?^`{|}~-]+$/.test(n)) return n + ' <' + email + '>'
+  return '"' + n.replace(/["\\]/g, '\\$&') + '" <' + email + '>'
+}
+
+/** Addresses for a To line, folded so no line gets too long. */
+function foldAddresses(list: string[]): string {
+  const lines = ['']
+  for (const a of list) {
+    const last = lines.length - 1
+    if (lines[last] && lines[last].length + a.length > 70) {
+      lines[last] += ','
+      lines.push(a)
+    } else lines[last] += (lines[last] ? ', ' : '') + a
+  }
+  return lines.join('\r\n ')
+}
+
+/**
+ * A Gmail API `raw` new email (messages/send): plain text in UTF-8, from
+ * `from` with its name. It carries its own Message-ID and Date, so the answers
+ * to it thread under it in Gmail and in the other side's mail program.
+ * `id` is a random string for the Message-ID; passed in so tests can fix it.
+ */
+export function buildNewEmail(o: {
+  from: string
+  name?: string
+  to: string[]
+  subject: string
+  text: string
+  date: Date
+  id: string
+}): string {
+  const domain = o.from.split('@')[1] || 'mail.gmail.com'
+  const headers = [
+    'From: ' + formatAddress(o.name ?? '', o.from),
+    'To: ' + foldAddresses(o.to),
+    'Subject: ' + encodeHeader(o.subject.replace(/[\r\n]+/g, ' ').trim()),
+    'Date: ' + o.date.toUTCString().replace(/GMT$/, '+0000'),
+    'Message-ID: <' + o.id + '@' + domain + '>',
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+  ]
+  // Mail text lines end in CRLF; Telegram gives plain \n.
+  const text = o.text.replace(/\r?\n/g, '\r\n')
+  const body = bytesToBase64(new TextEncoder().encode(text)).replace(/.{76}/g, '$&\r\n')
+  return bytesToBase64url(new TextEncoder().encode(headers.join('\r\n') + '\r\n\r\n' + body))
+}
+
+// ---------------------------------------------------------------- polish --
+
+/**
+ * What the AI is told. The rules about numbers and names matter most: a
+ * changed amount or load number in an email to a broker costs real money, and
+ * numbersChanged double-checks them anyway.
+ */
+export const POLISH_PROMPT = [
+  'You polish emails for a small US trucking company (dispatch, brokers, shippers, loads, invoices, factoring, ' +
+  'insurance).',
+  'Rewrite the email you are given so it is clear, polite, professional and short.',
+  'Rules:',
+  '- Keep the writer\'s meaning. Do not add facts, promises, questions or details that are not in the email.',
+  '- Keep every name, number, amount, date, time, load number, PO number, phone number, email address and street ' +
+  'address exactly as written.',
+  '- Write in the same language as the email.',
+  '- Plain text only: no markdown, no headings, no bold, no bullet symbols the writer did not use.',
+  '- Keep the writer\'s greeting and sign-off. If there is no sign-off, you may end with a simple one such as ' +
+  '"Thanks," with no name.',
+  '- Never add placeholders such as [Your Name], a subject line, notes, or quotes around the email.',
+  'Return only the email text.',
+].join('\n')
+
+/**
+ * The chat/completions request body for Groq and Cloudflare (both speak the
+ * OpenAI format). Low temperature keeps it close to what was written.
+ * reasoning_effort goes only to gpt-oss models: others refuse the field.
+ * max_tokens is set because Cloudflare's default (256) would cut the email off.
+ */
+export function polishRequest(model: string, text: string): Record<string, unknown> {
+  return {
+    model,
+    messages: [{ role: 'system', content: POLISH_PROMPT }, { role: 'user', content: text }],
+    temperature: 0.3,
+    max_tokens: 4096,
+    ...(/gpt-oss/i.test(model) ? { reasoning_effort: 'low' } : {}),
+  }
+}
+
+/** The AI's text with markdown and wrapping taken off, since the email goes out as plain text. */
+export function cleanAiText(s: string): string {
+  let t = s.replace(/\r\n?/g, '\n').trim()
+  t = t.replace(/^```[\w-]*\n([\s\S]*?)\n?```$/, '$1').trim()
+  t = t.replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/__([^_\n]+)__/g, '$1')
+  t = t.replace(/^#{1,6}[ \t]+/gm, '')
+  t = t.replace(/^subject:[^\n]*\n+/i, '')
+  t = t.replace(/^[ \t]*\[(?:your|my|sender'?s?)\b[^\]\n]*\][ \t]*$/gim, '')
+  if (/^"[^"]*"$/.test(t)) t = t.slice(1, -1)
+  return t.replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/**
+ * The email text in an AI answer: OpenAI's chat format (Groq, and
+ * Cloudflare's /ai/v1 endpoint), or Cloudflare's own result shapes. '' when
+ * there is none.
+ */
+export function aiAnswer(body: unknown): string {
+  // deno-lint-ignore no-explicit-any
+  const b = body as any
+  // deno-lint-ignore no-explicit-any
+  const output = Array.isArray(b?.output) ? b.output.find((o: any) => o?.type === 'message') : undefined
+  const raw = b?.choices?.[0]?.message?.content ?? b?.result?.choices?.[0]?.message?.content ??
+    // deno-lint-ignore no-explicit-any
+    b?.result?.response ?? b?.output_text ?? output?.content?.find((c: any) => c?.type === 'output_text')?.text
+  return typeof raw === 'string' ? cleanAiText(raw) : ''
+}
+
+/** Why an AI service failed, in words for the toast. `code` is its error code, if it sent one. */
+export function aiFailReason(status: number, code = ''): string {
+  if (status === 401 || status === 403) return 'the key was refused (send a new one with /aikey)'
+  if (status === 429) return 'too busy, try again in a minute'
+  if (status >= 500) return 'the service is down'
+  if (status === 404 || /model/i.test(code)) return 'the model was retired (see ai_model in the README)'
+  return 'error ' + status
+}
+
+/** One number-like thing in a text. `key` ignores how it is written: $1,850.00 and 1850 share one. */
+interface NumberMark {
+  kind: 'phone' | 'date' | 'time' | 'number'
+  key: string
+  /** Dates only: the year, when the text gave one. */
+  year?: string
+  /** As it was written, for the warning. */
+  text: string
+}
+
+/**
+ * Phones, dates (11/13, Nov 13, 13 Nov, 2026-11-13), times (10:30 AM, 2pm)
+ * and numbers (amounts, load and PO numbers). Earlier ones win where they
+ * overlap, so the digits of a date or a phone don't count again as numbers.
+ */
+const NUMBER_MARKS = [
+  '(?<phone>(?<!\\d)(?:\\+?1[\\s.-]?)?(?:\\(\\d{3}\\)|\\d{3})[\\s.-]?\\d{3}[\\s.-]\\d{4}(?!\\d))',
+  '(?<named>\\b' + MONTH + '\\s+\\d{1,2}(?:st|nd|rd|th)?\\b(?:,?\\s+\\d{4}\\b)?)',
+  '(?<dayfirst>\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:of\\s+)?' + MONTH + '(?:,?\\s+\\d{4}\\b)?)',
+  '(?<iso>(?<![\\d-])\\d{4}-\\d{1,2}-\\d{1,2}(?![\\d-]))',
+  '(?<slash>(?<![\\d/.])\\d{1,2}/\\d{1,2}(?:/(?:\\d{4}|\\d{2}))?(?![\\d/]))',
+  '(?<time>\\b\\d{1,2}(?::\\d{2})?\\s?[ap]\\.?m\\b\\.?|\\b\\d{1,2}:\\d{2}\\b)',
+  '(?<num>(?:\\$\\s?)?(?:\\d{1,3}(?:,\\d{3})+(?!\\d)|\\d+)(?:\\.\\d+)?)',
+].join('|')
+
+/** A date's mark from its numbers: month, day and maybe a year (two digits mean 20xx). */
+function dateMark(text: string, mon: number, day: number, year?: string): NumberMark {
+  const y = year ? (year.length === 2 ? '20' + year : year) : undefined
+  return { kind: 'date', key: 'd:' + mon + '/' + day, year: y, text }
+}
+
+/** Every number-like thing in `text`, once each, in the order they first appear. */
+function numberMarks(text: string): NumberMark[] {
+  const re = new RegExp(NUMBER_MARKS, 'gi')
+  const marks: NumberMark[] = []
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const g = m.groups ?? {}
+    const raw = m[0].trim()
+    const nums: string[] = [...raw.matchAll(/\d+/g)].map((x) => x[0])
+    const monthWord = (raw.match(/[a-z]+/gi) ?? [])
+      .find((w) => w.length >= 3 && MONTHS.includes(w.slice(0, 3).toLowerCase()))
+    // "we may 2 trucks": a small "may" is the verb, not the month. Read on after it.
+    if ((g.named || g.dayfirst) && monthWord === 'may') {
+      if (g.named) {
+        re.lastIndex = m.index + m[0].indexOf('may') + 3
+        continue
+      }
+      marks.push({ kind: 'number', key: 'n:' + nums[0], text: nums[0] })
+      re.lastIndex = m.index + m[0].indexOf(nums[0]) + nums[0].length
+      continue
+    }
+    if (g.phone) {
+      marks.push({ kind: 'phone', key: 'p:' + nums.join('').replace(/^1(?=\d{10}$)/, ''), text: raw })
+    } else if (g.named || g.dayfirst) {
+      const mon = MONTHS.indexOf(monthWord!.slice(0, 3).toLowerCase()) + 1
+      marks.push(dateMark(raw, mon, +nums[0], nums.find((n) => n.length === 4)))
+    } else if (g.iso) {
+      marks.push(dateMark(raw, +nums[1], +nums[2], nums[0]))
+    } else if (g.slash) {
+      marks.push(dateMark(raw, +nums[0], +nums[1], nums[2]))
+    } else if (g.time) {
+      let h = +nums[0]
+      if (/p\.?m/i.test(raw) && h < 12) h += 12
+      if (/a\.?m/i.test(raw) && h === 12) h = 0
+      marks.push({ kind: 'time', key: 't:' + h + ':' + (nums[1] ?? '00'), text: raw })
+    } else {
+      let n = raw.replace(/[$\s,]/g, '')
+      if (n.includes('.')) n = n.replace(/0+$/, '').replace(/\.$/, '')
+      // A bare 10-digit number is a phone written without dashes.
+      const phone = /^\d+$/.test(raw) && (n.length === 10 || (n.length === 11 && n.startsWith('1')))
+      marks.push(phone
+        ? { kind: 'phone', key: 'p:' + n.slice(-10), text: raw }
+        : { kind: 'number', key: 'n:' + n, text: raw })
+    }
+  }
+  const seen = new Set<string>()
+  return marks.filter((x) => {
+    const id = x.key + '|' + (x.year ?? '')
+    if (seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+}
+
+/** Whether `list` has `mark`. A date without a year matches the same day with any year. */
+function hasMark(list: NumberMark[], mark: NumberMark): boolean {
+  return list.some((x) => x.key === mark.key && (!x.year || !mark.year || x.year === mark.year))
+}
+
+/**
+ * The number guard: numbers, amounts, dates, times and phones that are in one
+ * text but not the other, so the owner checks them before an AI rewrite goes
+ * out. "$1,850", "1850" and "1,850.00" are one amount; "11/13" and "Nov 13"
+ * one date. A changed one reads "$1,850 → $1,580", a lost one "11/13 missing",
+ * a new one "4412 added".
+ */
+export function numbersChanged(before: string, after: string): string[] {
+  const a = numberMarks(before)
+  const b = numberMarks(after)
+  const gone = a.filter((x) => !hasMark(b, x))
+  const added = b.filter((x) => !hasMark(a, x))
+  const out: string[] = []
+  for (const g of gone) {
+    const i = added.findIndex((x) => x.kind === g.kind)
+    out.push(i >= 0 ? g.text + ' → ' + added.splice(i, 1)[0].text : g.text + ' missing')
+  }
+  return [...out, ...added.map((x) => x.text + ' added')]
+}
+
+/** How much text a preview shows: with the lines around it, it stays under Telegram's 4096 characters. */
+const DRAFT_CHARS = 2500
+
+/**
+ * A preview before ✅ Send, for a reply or a new email. `rows` are plain
+ * "label: value" lines (empty values are left out). With `original`, the text
+ * is the ✨ polished one, and every number that differs from the owner's own
+ * text is listed under it.
+ */
+export function draftText(o: {
+  title?: string
+  rows: [string, string][]
+  body: string
+  original?: string | null
+}): string {
+  const shown = clip(o.body, DRAFT_CHARS)
+  const polished = o.original !== undefined && o.original !== null
+  const lines = [
+    ...(o.title ? ['<b>' + esc(o.title) + '</b>'] : []),
+    ...o.rows.filter(([, v]) => v).map(([k, v]) => '<b>' + esc(k) + ':</b> ' + esc(clip(v, 300))),
+    '',
+    ...(polished ? ['✨ <i>Polished by AI. ↩ Use mine brings back your text.</i>', ''] : []),
+    esc(shown),
+    ...(shown.length < o.body.length ? ['(cut here; the whole text goes out)'] : []),
+  ]
+  const changes = polished ? numbersChanged(o.original!, o.body) : []
+  if (changes.length) lines.push('', '⚠️ Check these: ' + esc(clip(changes.join(', '), 300)))
+  return lines.join('\n')
+}
+
+/**
+ * Buttons under a preview. Kind r is a reply (✅ y, 👥 Y, ✕ n, as before),
+ * kind n a new email (✅ A, ✕ K). ✨ Polish (E) becomes ↩ Use mine (O) once
+ * the text is polished.
+ */
+export function draftKeyboard(kind: 'r' | 'n', key: string, polished: boolean, replyAll = false): {
+  inline_keyboard: Button[][]
+} {
+  const send: Button = { text: '✅ Send', callback_data: (kind === 'r' ? 'y:' : 'A:') + key }
+  const cancel: Button = { text: '✕ Cancel', callback_data: (kind === 'r' ? 'n:' : 'K:') + key }
+  const ai: Button = polished
+    ? { text: '↩ Use mine', callback_data: 'O:' + kind + ':' + key }
+    : { text: '✨ Polish', callback_data: 'E:' + kind + ':' + key }
+  if (!replyAll) return { inline_keyboard: [polished ? [send, ai, cancel] : [ai, send, cancel]] }
+  return { inline_keyboard: [[send, { text: '👥 Reply all', callback_data: 'Y:' + key }], [ai, cancel]] }
+}

@@ -53,6 +53,16 @@ import {
   type Day,
   type HistoryRecord,
 } from './mail.ts'
+// ✍️ New email and ✨ Polish.
+import {
+  aiAnswer,
+  aiFailReason,
+  buildNewEmail,
+  draftKeyboard,
+  draftText,
+  parseRecipients,
+  polishRequest,
+} from './mail.ts'
 
 /**
  * Mail bot: posts new mail from every connected inbox to one Telegram chat and
@@ -146,6 +156,8 @@ const HELP = [
   'On an email: ▾ More shows the rest, ↩ Reply answers it, ⏰ brings it back later, 🗑 removes it from this chat ' +
   '(it stays in Gmail), 🔕 stops emails like it.',
   'Replies: tap ↩ Reply (or swipe the email) and type your answer. I show you the reply before it goes out.',
+  '✍️ /new: write a new email from one of your inboxes. ✨ Polish (on a new email or a reply) makes your text ' +
+  'clear and polite with AI; it needs a free key, see /aikey.',
 ].join('\n')
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } })
@@ -873,14 +885,16 @@ async function onUpdate(cfg: Config, u: any): Promise<void> {
   if (chat !== owner) return
 
   if (cfg.awaiting_filter && m.reply_to_message) await db.from('mailbot_config').delete().eq('key', 'awaiting_filter')
-  if (text.startsWith('/')) await onCommand(cfg, chat, text)
+  if (text.startsWith('/')) await onCommand(cfg, chat, text, m.message_id)
+  else if (await onDraftText(cfg, chat, m, text)) return
   else if (m.reply_to_message) await onReply(chat, m, text)
   else if (!(await applyAwaitedFilter(cfg, chat, text))) {
     await send(chat, 'To answer an email, use Telegram\'s Reply on it. /help lists the commands.', TRASH)
   }
 }
 
-async function onCommand(cfg: Config, chat: string, text: string): Promise<void> {
+/** `messageId`: the owner's command message, which /new clears later and /aikey deletes at once. */
+async function onCommand(cfg: Config, chat: string, text: string, messageId = 0): Promise<void> {
   const [first, ...rest] = text.split(/\s+/)
   const cmd = first.toLowerCase().replace(/@\w+$/, '')
   const arg = rest.join(' ').trim()
@@ -933,6 +947,10 @@ async function onCommand(cfg: Config, chat: string, text: string): Promise<void>
       return await cmdMuted(chat)
     case '/quiet':
       return await cmdQuiet(cfg, chat, arg)
+    case '/new':
+      return await cmdNew(chat, messageId)
+    case '/aikey':
+      return await cmdAiKey(cfg, chat, arg, messageId)
     case '/pause':
       await setConfig('paused', 'true')
       await send(chat, '⏸ Paused. /resume turns emails back on.', TRASH)
@@ -1273,6 +1291,8 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
       await db.from('mailbot_pending_replies').delete().eq('key', a)
       await clearReplyMessages(q)
       toast = 'Cancelled'
+    } else if (/^[NAKEO]$/.test(act)) {
+      toast = await onDraftButton(cfg, q, act, a, b)
     } else if (b) {
       toast = await onEmailButton(cfg, q, act, await inboxById(Number(a)), b, c)
     }
@@ -1283,7 +1303,8 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
   await tg('answerCallbackQuery', {
     callback_query_id: q.id,
     text: toast.slice(0, 190),
-    show_alert: toast.startsWith('Failed'),
+    // ⚠️ and the "needs a key" note are too long to read in a toast that fades: they stay until OK.
+    show_alert: toast.startsWith('Failed') || toast.startsWith('⚠️') || toast === AI_NO_KEY,
   })
 }
 
@@ -1739,23 +1760,34 @@ async function onReply(chat: string, m: any, text: string): Promise<void> {
     return
   }
   const email = readEmail(await gmail(ib as Inbox, `messages/${ref.id}?format=metadata&${REPLY_HEADERS}`))
-  const one = buildReply(email, ib.email, text, false)
-  const all = buildReply(email, ib.email, text, true)
   const key = randomToken(9)
   await db.from('mailbot_pending_replies').insert({ key, inbox_id: ib.id, message_id: ref.id, body: text })
   await db.from('mailbot_pending_replies').delete().lt('created_at', new Date(Date.now() - 86_400_000).toISOString())
 
-  const lines = ['↩️ <b>To:</b> ' + esc(one.to.join(', ')), '<b>From:</b> ' + esc(ib.email)]
-  if (all.cc.length) lines.push('<b>Reply all also goes to:</b> ' + esc(all.cc.join(', ')))
-  lines.push('', esc(text))
-  const buttons: Button[] = [{ text: '✅ Send', callback_data: 'y:' + key }]
-  if (all.cc.length) buttons.push({ text: '👥 Reply all', callback_data: 'Y:' + key })
-  buttons.push({ text: '✖ Cancel', callback_data: 'n:' + key })
-  await send(chat, lines.join('\n'), { inline_keyboard: [buttons] }, m.message_id)
+  const view = replyPreview(ib as Inbox, email, key, text, null)
+  await send(chat, view.text, view.markup, m.message_id)
   // The "↩️ Reply to …" prompt has done its job; the confirmation shows what was typed.
   const prompt = m.reply_to_message
   if (prompt.from?.is_bot && String(prompt.text ?? '').startsWith('↩️ Reply to')) {
     await tg('deleteMessage', { chat_id: chat, message_id: prompt.message_id })
+  }
+}
+
+/**
+ * The reply before it goes out: who gets it, the text, and ✨ Polish / ✅ Send
+ * / 👥 Reply all / ✕ Cancel. With `original`, `body` is the polished text and
+ * ↩ Use mine replaces ✨ Polish.
+ */
+function replyPreview(ib: Inbox, email: Email, key: string, body: string, original: string | null): Preview {
+  const one = buildReply(email, ib.email, body, false)
+  const all = buildReply(email, ib.email, body, true)
+  return {
+    text: draftText({
+      rows: [['↩️ To', one.to.join(', ')], ['From', ib.email], ['Reply all also goes to', all.cc.join(', ')]],
+      body,
+      original,
+    }),
+    markup: draftKeyboard('r', key, original !== null, all.cc.length > 0),
   }
 }
 
@@ -1785,6 +1817,463 @@ async function sendPendingReply(q: any, key: string, all: boolean): Promise<stri
   }
   await clearReplyMessages(q)
   return 'Sent to ' + [...reply.to, ...reply.cc].join(', ')
+}
+
+// -------------------------------------------------------------- new email --
+
+/** A new email being written with /new: a row of mailbot_drafts. */
+interface Draft {
+  key: string
+  inbox_id: number | null
+  /** What the bot waits for: the inbox, the To, the subject, the text, or ✅ Send (ready). */
+  step: 'inbox' | 'to' | 'subject' | 'body' | 'ready'
+  recipients: string
+  subject: string
+  body: string
+  /** The owner's own text while `body` holds the ✨ polished one. */
+  original: string | null
+  preview_id: number | null
+  /**
+   * The /new message, the bot's questions and the typed answers: an answer typed under one of them belongs to
+   * this draft, and they all leave the chat once it is sent or cancelled.
+   */
+  messages: number[]
+  created_at: string
+  updated_at: string
+}
+
+/** A preview before ✅ Send: its text and buttons. */
+interface Preview {
+  text: string
+  markup: { inline_keyboard: Button[][] }
+}
+
+/** Without Telegram's Reply, a typed message counts as the answer only this soon after the question. */
+const DRAFT_WAIT_MS = 30 * 60_000
+/** New emails and replies that wait longer than a day for ✅ Send are dropped. */
+const DRAFT_TTL_MS = 86_400_000
+const GONE = 'Already sent, cancelled or older than a day'
+
+const QUESTIONS = {
+  to: ['📮 <b>To:</b> type the email address. For more than one, put commas between them.', 'name@company.com'],
+  subject: ['✏️ <b>Subject:</b> type the subject.', 'Subject'],
+  body: ['📝 <b>Text:</b> type the email. You\'ll see it before it goes out.', 'Your email…'],
+} as const
+
+function dayAgo(): string {
+  return new Date(Date.now() - DRAFT_TTL_MS).toISOString()
+}
+
+/** /new: first, which inbox sends it. A half-written new email from before leaves the chat with its questions. */
+async function cmdNew(chat: string, commandId: number): Promise<void> {
+  const inboxes = await connectedInboxes()
+  if (!inboxes.length) {
+    await send(chat, 'No inboxes connected yet. Send /connect.', TRASH)
+    return
+  }
+  await db.from('mailbot_drafts').delete().lt('created_at', dayAgo())
+  const { data: old } = await db.from('mailbot_drafts').delete().neq('step', 'ready').select('messages')
+  for (const o of old ?? []) await clearMessages(chat, o.messages ?? [])
+  const key = randomToken(9)
+  const mine = commandId ? [commandId] : []
+  const { error } = await db.from('mailbot_drafts').insert({ key, messages: mine })
+  if (error) throw new Error('drafts: ' + error.message)
+  const res = await send(chat, '✍️ <b>New email</b>\nSend it from which inbox?', {
+    inline_keyboard: [
+      ...inboxes.map((ib) => [{ text: '📤 ' + ib.email, callback_data: `N:${key}:${ib.id}` }]),
+      [{ text: '✕ Cancel', callback_data: 'K:' + key }],
+    ],
+  })
+  if (!res.ok) throw new TelegramError(res)
+  await db.from('mailbot_drafts').update({ messages: [...mine, res.result.message_id] }).eq('key', key)
+}
+
+/** Buttons of a new email (N inbox, A ✅ Send, K ✕ Cancel) and of any preview (E ✨ Polish, O ↩ Use mine). */
+// deno-lint-ignore no-explicit-any
+async function onDraftButton(cfg: Config, q: any, act: string, a: string, b?: string): Promise<string> {
+  if (act === 'N') return await pickInbox(q, a, Number(b))
+  if (act === 'A') return await sendDraft(q, a)
+  if (act === 'K') return await cancelDraft(q, a)
+  const kind: DraftKind = a === 'r' ? 'r' : 'n'
+  return act === 'E' ? await polishPending(cfg, q, kind, b ?? '') : await useMine(q, kind, b ?? '')
+}
+
+/** The inbox is chosen: the first question, who it is to. */
+// deno-lint-ignore no-explicit-any
+async function pickInbox(q: any, key: string, inboxId: number): Promise<string> {
+  const chat = String(q.message.chat.id)
+  const ib = await inboxById(inboxId)
+  // Only from the "inbox" step, so a double tap asks once.
+  const { data } = await db.from('mailbot_drafts')
+    .update({ inbox_id: ib.id, step: 'to', updated_at: new Date().toISOString() })
+    .eq('key', key).eq('step', 'inbox').gt('created_at', dayAgo()).select().maybeSingle()
+  if (!data) {
+    const { data: still } = await db.from('mailbot_drafts').select('key').eq('key', key).maybeSingle()
+    return still ? '' : GONE
+  }
+  await edit(chat, q.message.message_id, '✍️ <b>New email</b> from <b>' + esc(ib.email) + '</b>',
+    { inline_keyboard: [[{ text: '✕ Cancel', callback_data: 'K:' + key }]] })
+  await ask(chat, data as Draft, 'to')
+  return ''
+}
+
+/** Asks a question as a Telegram reply prompt and remembers it, so the answer typed under it finds the draft. */
+async function ask(chat: string, d: Draft, step: 'to' | 'subject' | 'body', note = ''): Promise<void> {
+  const [question, placeholder] = QUESTIONS[step]
+  const res = await send(chat, (note ? note + '\n\n' : '') + question,
+    { force_reply: true, input_field_placeholder: placeholder })
+  if (!res.ok) throw new TelegramError(res)
+  await db.from('mailbot_drafts').update({ messages: [...d.messages, res.result.message_id] }).eq('key', d.key)
+}
+
+/**
+ * A typed answer for a new email: the To, the subject or the text. It counts
+ * when it answers the bot's question with Telegram's Reply, or comes soon
+ * after the question without it (the reply bar was closed) while /filter
+ * isn't waiting for words. Returns false when no new email waits for it, so
+ * the message goes on to the reply flow.
+ */
+// deno-lint-ignore no-explicit-any
+async function onDraftText(cfg: Config, chat: string, m: any, typed: string): Promise<boolean> {
+  const replyTo = m.reply_to_message?.message_id
+  if (!replyTo && cfg.awaiting_filter) return false
+  let find = db.from('mailbot_drafts').select('*').in('step', ['to', 'subject', 'body']).gt('created_at', dayAgo())
+  // Under any of its questions counts, also an older one after "try again".
+  find = replyTo
+    ? find.contains('messages', [replyTo])
+    : find.gt('updated_at', new Date(Date.now() - DRAFT_WAIT_MS).toISOString())
+  // No table yet (the migration isn't applied) reads as "no draft": replies still work.
+  const { data } = await find.order('updated_at', { ascending: false }).limit(1)
+  const d = data?.[0] as Draft | undefined
+  if (!d) return false
+  const step = d.step as 'to' | 'subject' | 'body'
+  const messages = [...(d.messages ?? []), m.message_id]
+  // A photo's caption is not taken as the text: the photo itself would be lost without a word.
+  const text = typeof m.text === 'string' ? typed : ''
+  // The step is claimed together with the answer, so a message Telegram delivers twice is used once.
+  const claim = async (change: Record<string, unknown>, next: Draft['step']): Promise<Draft | null> => {
+    const { data: moved } = await db.from('mailbot_drafts')
+      .update({ ...change, messages, step: next, updated_at: new Date().toISOString() })
+      .eq('key', d.key).eq('step', step).select().maybeSingle()
+    return moved as Draft | null
+  }
+  const to = step === 'to' ? parseRecipients(text) : null
+  if (!text || (to && (to.bad.length || !to.ok.length))) {
+    const again = await claim({}, step)
+    const note = !text
+      ? 'Text only, please.'
+      : '📮 This doesn\'t look like an email address: ' + esc(clip(to!.bad.join(', ') || text, 200)) + '.'
+    if (again) await ask(chat, again, step, note)
+    return true
+  }
+  if (step === 'to') {
+    const next = await claim({ recipients: to!.ok.join(', ') }, 'subject')
+    if (next) await ask(chat, next, 'subject')
+  } else if (step === 'subject') {
+    const next = await claim({ subject: text.replace(/\s+/g, ' ').slice(0, 250) }, 'body')
+    if (next) await ask(chat, next, 'body')
+  } else {
+    const ready = await claim({ body: text }, 'ready')
+    if (ready) await showNewPreview(chat, ready)
+  }
+  return true
+}
+
+/** The new email before it goes out: From, To, Subject, the text, and ✨ Polish / ✅ Send / ✕ Cancel. */
+function newPreview(ib: Inbox, d: Draft): Preview {
+  return {
+    text: draftText({
+      title: '✍️ New email',
+      rows: [['From', ib.email], ['To', d.recipients], ['Subject', d.subject]],
+      body: d.body,
+      original: d.original,
+    }),
+    markup: draftKeyboard('n', d.key, d.original !== null),
+  }
+}
+
+async function showNewPreview(chat: string, d: Draft): Promise<void> {
+  const view = newPreview(await inboxById(d.inbox_id ?? 0), d)
+  const res = await send(chat, view.text, view.markup)
+  if (!res.ok) throw new TelegramError(res)
+  await db.from('mailbot_drafts').update({ preview_id: res.result.message_id }).eq('key', d.key)
+}
+
+/** ✅ Send on a new email: it goes out from its inbox, the questions and answers leave, a short confirmation stays. */
+// deno-lint-ignore no-explicit-any
+async function sendDraft(q: any, key: string): Promise<string> {
+  const chat = String(q.message.chat.id)
+  // Deleting is the claim, as for replies: a double tap or a Telegram retry finds nothing the second time.
+  const { data } = await db.from('mailbot_drafts').delete()
+    .eq('key', key).eq('step', 'ready').gt('created_at', dayAgo()).select().maybeSingle()
+  if (!data) return GONE
+  const d = data as Draft
+  const ib = await mailDraft(d).catch(async (e) => {
+    // Not sent: put it back so ✅ Send can be tapped again.
+    await db.from('mailbot_drafts').insert(d)
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      // Gmail may have sent it anyway; a blind second tap could send it twice.
+      throw new Error('Gmail didn\'t answer in time. Look in Sent in Gmail before you tap ✅ Send again.')
+    }
+    throw e
+  })
+  await clearMessages(chat, d.messages)
+  const done = '✅ Sent from <b>' + esc(ib.email) + '</b> to ' + esc(clip(d.recipients, 300)) +
+    '\n<b>Subject:</b> ' + esc(clip(d.subject, 200))
+  if (!(await edit(chat, q.message.message_id, done, TRASH)).ok) await send(chat, done, TRASH)
+  return 'Sent from ' + ib.email
+}
+
+/** Sends a new email with Gmail from its inbox, and returns that inbox. */
+async function mailDraft(d: Draft): Promise<Inbox> {
+  const ib = await inboxById(d.inbox_id ?? 0)
+  const raw = buildNewEmail({
+    from: ib.email,
+    name: ib.label ?? '',
+    to: d.recipients.split(/,\s*/).filter(Boolean),
+    subject: d.subject,
+    text: d.body,
+    date: new Date(),
+    id: randomToken(18),
+  })
+  await gmail(ib, 'messages/send', { raw })
+  return ib
+}
+
+/** ✕ Cancel on a new email: it and all its messages leave the chat. */
+// deno-lint-ignore no-explicit-any
+async function cancelDraft(q: any, key: string): Promise<string> {
+  const { data } = await db.from('mailbot_drafts').delete().eq('key', key).select().maybeSingle()
+  const d = data as Draft | null
+  await clearMessages(q.message.chat.id, [...(d?.messages ?? []), d?.preview_id, q.message.message_id])
+  return d ? 'Cancelled' : GONE
+}
+
+/** Deletes chat messages in one call. Ones already gone are skipped; after 48 hours Telegram keeps them. */
+async function clearMessages(chat: string | number, ids: (number | null | undefined)[]): Promise<void> {
+  const list = [...new Set(ids.filter((id): id is number => Boolean(id)))]
+  for (let i = 0; i < list.length; i += 100) {
+    await tg('deleteMessages', { chat_id: chat, message_ids: list.slice(i, i + 100) })
+  }
+}
+
+// ----------------------------------------------------------------- polish --
+
+/** Groq's name for the model. Groq retires models often, so a mailbot_config row "ai_model" replaces it. */
+const AI_MODEL = 'openai/gpt-oss-120b'
+/** The same model on Cloudflare Workers AI, the backup; mailbot_config "ai_model_cloudflare" replaces it. */
+const CLOUDFLARE_AI_MODEL = '@cf/openai/gpt-oss-120b'
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+const AI_TIMEOUT_MS = 20_000
+const AI_NO_KEY = '✨ Polish needs a free AI key. Make one at console.groq.com (free, no card), ' +
+  'then send /aikey groq <key>.'
+
+/** Where a preview's text lives: r = a reply (mailbot_pending_replies), n = a new email (mailbot_drafts). */
+type DraftKind = 'r' | 'n'
+const PENDING_TABLE: Record<DraftKind, string> = { r: 'mailbot_pending_replies', n: 'mailbot_drafts' }
+
+/** What ✨ Polish and ↩ Use mine change, in either table. */
+interface Pending {
+  key: string
+  inbox_id: number | null
+  /** Replies only: the email it answers. */
+  message_id?: string
+  body: string
+  original: string | null
+}
+
+/** The AI keys from Vault, read only when Polish is tapped. Never logged, never shown. */
+async function aiKeys(): Promise<{ groq: string; cloudflare: { account: string; token: string } | null }> {
+  const [groq, cloudflare] = await Promise.all(['groq', 'cloudflare'].map(async (name) => {
+    const { data, error } = await db.rpc('mailbot_ai_key', { p_name: name })
+    if (error) console.error('ai key', name, error.message)
+    return String(data ?? '')
+  }))
+  const [account, token] = cloudflare.split(/\s+/)
+  return { groq, cloudflare: account && token ? { account, token } : null }
+}
+
+/** One AI service's rewrite of `text`, or why it failed. The key goes only into the Authorization header. */
+async function askAi(service: string, url: string, key: string, model: string, text: string): Promise<{
+  text?: string
+  error?: string
+}> {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(polishRequest(model, text)),
+      signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+    })
+    // deno-lint-ignore no-explicit-any
+    const body: any = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      // Only the status and the error code are logged: an error text could quote part of the key.
+      const code = String(body?.error?.code ?? body?.errors?.[0]?.code ?? '')
+      console.error('polish', service, res.status, code)
+      return { error: aiFailReason(res.status, code) }
+    }
+    const answer = aiAnswer(body)
+    return answer ? { text: answer } : { error: 'it sent back no text' }
+  } catch (e) {
+    const timedOut = e instanceof DOMException && e.name === 'TimeoutError'
+    console.error('polish', service, timedOut ? 'timeout' : e instanceof Error ? e.name : 'error')
+    return { error: timedOut ? 'no answer in ' + AI_TIMEOUT_MS / 1000 + ' seconds' : 'could not connect' }
+  }
+}
+
+/**
+ * The owner's text rewritten by Groq, or by Cloudflare when Groq fails
+ * (timeout, busy, down, key refused) and Cloudflare is set up. When neither
+ * works, `error` is the toast and the text stays as it was.
+ */
+async function polishText(cfg: Config, text: string): Promise<{ text?: string; error?: string }> {
+  const keys = await aiKeys()
+  if (!keys.groq && !keys.cloudflare) return { error: AI_NO_KEY }
+  const fails: string[] = []
+  if (keys.groq) {
+    const r = await askAi('groq', GROQ_URL, keys.groq, cfg.ai_model || AI_MODEL, text)
+    if (r.text) return r
+    fails.push('Groq: ' + r.error)
+  }
+  if (keys.cloudflare) {
+    const url = 'https://api.cloudflare.com/client/v4/accounts/' + encodeURIComponent(keys.cloudflare.account) +
+      '/ai/v1/chat/completions'
+    const model = cfg.ai_model_cloudflare || CLOUDFLARE_AI_MODEL
+    const r = await askAi('cloudflare', url, keys.cloudflare.token, model, text)
+    if (r.text) return r
+    fails.push('Cloudflare: ' + r.error)
+  }
+  return { error: '⚠️ Polish didn\'t work. ' + fails.join('. ') + '. Your text is unchanged.' }
+}
+
+/** A reply or new email whose preview is out, waiting for ✅ Send; null when it was sent, cancelled or is too old. */
+async function pendingRow(kind: DraftKind, key: string): Promise<Pending | null> {
+  let find = db.from(PENDING_TABLE[kind]).select('*').eq('key', key).gt('created_at', dayAgo())
+  if (kind === 'n') find = find.eq('step', 'ready')
+  const { data } = await find.maybeSingle()
+  return data as Pending | null
+}
+
+/** Loads what a preview needs once (the inbox; for a reply, the email too), then draws it for any text. */
+async function previewDrawer(kind: DraftKind, row: Pending): Promise<(p: Pending) => Preview> {
+  const ib = await inboxById(row.inbox_id ?? 0)
+  if (kind === 'n') return (p) => newPreview(ib, p as Draft)
+  const email = readEmail(await gmail(ib, `messages/${row.message_id}?format=metadata&${REPLY_HEADERS}`))
+  return (p) => replyPreview(ib, email, p.key, p.body, p.original)
+}
+
+/**
+ * Swaps the text. `polish` true: only while it isn't polished yet; false
+ * (↩ Use mine): only while it is. After a double tap, or ✅ Send in the
+ * meantime (the row is gone), nothing changes and this returns null.
+ */
+async function setText(kind: DraftKind, key: string, body: string, original: string | null, polish: boolean) {
+  const change = db.from(PENDING_TABLE[kind]).update({ body, original }).eq('key', key)
+  const { data } = await (polish ? change.is('original', null) : change.not('original', 'is', null)).select()
+    .maybeSingle()
+  return data as Pending | null
+}
+
+/** Puts the new text in the preview. If Telegram refuses, the old text goes back: ✅ Send must send what is shown. */
+// deno-lint-ignore no-explicit-any
+async function showText(q: any, kind: DraftKind, view: Preview, before: Pending): Promise<void> {
+  const res = await edit(q.message.chat.id, q.message.message_id, view.text, view.markup)
+  if (res.ok) return
+  await db.from(PENDING_TABLE[kind]).update({ body: before.body, original: before.original }).eq('key', before.key)
+  throw new TelegramError(res)
+}
+
+/** ✨ Polish: the AI rewrites the text; the preview shows it with ↩ Use mine, and a warning if numbers changed. */
+// deno-lint-ignore no-explicit-any
+async function polishPending(cfg: Config, q: any, kind: DraftKind, key: string): Promise<string> {
+  const row = await pendingRow(kind, key)
+  if (!row) return GONE
+  if (row.original !== null) return ''
+  // Loaded before the AI call: once the text is swapped, the preview must be able to show it.
+  const draw = await previewDrawer(kind, row)
+  const started = Date.now()
+  const ai = await polishText(cfg, row.body)
+  if (!ai.text) {
+    // After a long wait (Groq, then Cloudflare) the toast may come too late to show, so the reason comes here too.
+    if (Date.now() - started > 10_000) await send(String(q.message.chat.id), esc(ai.error ?? ''), TRASH)
+    return ai.error ?? ''
+  }
+  if (ai.text === row.body.trim()) return '✨ Your text already reads well. Nothing changed.'
+  const saved = await setText(kind, key, ai.text, row.body, true)
+  if (!saved) return ''
+  await showText(q, kind, draw(saved), row)
+  return '✨ Polished. Read it before you send.'
+}
+
+/** ↩ Use mine: back to the owner's own text, with ✨ Polish again. */
+// deno-lint-ignore no-explicit-any
+async function useMine(q: any, kind: DraftKind, key: string): Promise<string> {
+  const row = await pendingRow(kind, key)
+  if (!row) return GONE
+  if (row.original === null) return ''
+  const draw = await previewDrawer(kind, row)
+  const saved = await setText(kind, key, row.original, null, false)
+  if (!saved) return ''
+  await showText(q, kind, draw(saved), row)
+  return 'Your own text is back'
+}
+
+// ---------------------------------------------------------------- ai keys --
+
+const AI_KEY_HOWTO = [
+  'Groq is free: make a key at console.groq.com (no card), then send <code>/aikey groq &lt;key&gt;</code>',
+  'Backup, if you want one: <code>/aikey cloudflare &lt;account_id&gt; &lt;token&gt;</code>',
+].join('\n')
+
+/**
+ * /aikey groq <key>, /aikey cloudflare <account_id> <token>: saves the key in
+ * Vault. The message that carries it is deleted first, so the key doesn't
+ * stay in the chat. /aikey alone shows which keys are set, never the keys.
+ */
+async function cmdAiKey(cfg: Config, chat: string, arg: string, messageId: number): Promise<void> {
+  const words = arg.split(/\s+/).filter(Boolean)
+  if (!words.length) return await showAiKeys(cfg, chat)
+  const deleted = messageId ? (await tg('deleteMessage', { chat_id: chat, message_id: messageId })).ok : false
+  const unsafe = deleted ? '' : '\n\n⚠️ I couldn\'t delete your message with the key. Please delete it yourself.'
+  const name = words[0].toLowerCase()
+  const rest = words.slice(1)
+  let secret = ''
+  if (name === 'groq' && rest.length === 1 && rest[0].length >= 20) secret = rest[0]
+  if (name === 'cloudflare' && rest.length === 2 && /^[0-9a-f]{32}$/i.test(rest[0]) && rest[1].length >= 20) {
+    secret = rest.join(' ')
+  }
+  if (!secret) {
+    await send(chat, 'That didn\'t look right, so nothing was saved.' +
+      (deleted ? ' I deleted your message in case it had a key in it.' : '') + '\n\n' + AI_KEY_HOWTO + unsafe, TRASH)
+    return
+  }
+  const { error } = await db.rpc('mailbot_store_ai_key', { p_name: name, p_secret: secret })
+  if (error) {
+    // An error text could quote what was sent, so the key parts are blanked out before it is shown.
+    const message = rest.reduce((s, part) => s.split(part).join('…'), error.message)
+    await send(chat, '⚠️ Couldn\'t save the key: ' + esc(message) + unsafe, TRASH)
+    return
+  }
+  await send(chat, (name === 'groq'
+    ? '🔑 Groq key saved. ✨ Polish works now.'
+    : '🔑 Cloudflare key saved. ✨ Polish uses it when Groq doesn\'t answer.') + unsafe, TRASH)
+}
+
+async function showAiKeys(cfg: Config, chat: string): Promise<void> {
+  const { data, error } = await db.rpc('mailbot_ai_key_names')
+  if (error) throw new Error('ai keys: ' + error.message)
+  const set = new Set((data ?? []) as string[])
+  const mark = (name: string) => (set.has(name) ? '✅ set' : '✕ not set')
+  await send(chat, [
+    '🔑 <b>AI keys for ✨ Polish</b>',
+    'Groq: ' + mark('groq'),
+    'Cloudflare (backup): ' + mark('cloudflare'),
+    'Model: ' + esc(cfg.ai_model || AI_MODEL),
+    '',
+    AI_KEY_HOWTO,
+    'I delete the message with the key right away. Keys are kept in Supabase Vault.',
+  ].join('\n'), TRASH)
 }
 
 // ----------------------------------------------------------------- routes --
