@@ -30,12 +30,13 @@ email sent nearly every one of them to the chat.
 ## What comes to the chat
 
 1. 📌 **Tagged** emails, 🔴 **urgent insurance** and ⭐ **your people**: always.
-   **💬 Replies to you** too: a reply in a conversation the inbox wrote in
-   before comes marked `💬 Reply`, whatever the templates, the money list and
-   `/filter` say (🔕 still stops it). Load conversations stay out (rule 2).
-   On 3 Nov two replies from T-Mobile support in a conversation the inbox
-   started went to the daily list; that can't happen now. In a day of real
-   mail this adds about 3 emails: 13 replies to the inboxes, 10 of them loads.
+   **New replies in a conversation you starred (☆ in Gmail) or tagged** too,
+   marked `⭐ Starred · reply` or `📌 erbol · reply`, even about a load and
+   whatever the templates say (🔕 still stops it). They get the "⏳ No reply
+   yet" check. Gmail puts a star or label only on the emails you marked, not
+   on later replies, so the bot looks at the whole conversation. Unstar and
+   untag it in Gmail to stop. (On 3 Nov two replies in a tagged T-Mobile
+   conversation went to the daily list; that can't happen now.)
 2. 🚚 **Load emails: never**, even when they say "payment". A load email is
    one whose subject has a load or PO number, "rate confirmation", "delivery
    receipt", BOL, POD, tender, pickup, TONU, detention, lumper, a PRO #, or a
@@ -61,11 +62,9 @@ that inbox (a dispatcher, an accountant) can tag an email for you.
 
 - Tagging a whole conversation sends only its newest message.
 - **New replies in a tagged conversation come too**, marked `📌 erbol · reply`,
-  with the "⏳ No reply yet" check. Gmail puts the label only on the emails
-  that were in the conversation when you tagged it, so the bot looks at the
-  whole conversation when a reply arrives. To stop: remove the label from the
-  conversation in Gmail, or 🔕 "Emails like this one". (Before this, on 3 Nov,
-  two replies in a tagged T-Mobile conversation went to the daily list.)
+  with the "⏳ No reply yet" check. A Gmail ☆ star does the same for replies
+  (`⭐ Starred · reply`), but the starred email itself doesn't come: you're
+  already looking at it. To stop: remove the label or star in Gmail, or 🔕.
 - A Gmail filter that puts the label on (for example "from: my accountant →
   label erbol") works too: those emails arrive tagged and come straight here.
 - Each email comes once per tag. Spam and the bin are left out.

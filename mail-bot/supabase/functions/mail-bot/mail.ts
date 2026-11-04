@@ -832,17 +832,17 @@ export function threadHasLabel(thread: { messages?: { labelIds?: string[] }[] },
 
 /**
  * What a reply's conversation (threads/{id}?format=minimal) tells: `tagged`,
- * an email in it has the tag label; `ours`, this inbox wrote in it before the
- * reply came (a sent email earlier than `before`, in ms), so it answers you.
+ * an email in it has the tag label; `starred`, you starred an email in it in
+ * Gmail. Gmail puts both only on the emails you marked, never on the replies
+ * that come after, so the whole conversation is what counts.
  */
 export function conversationOf(
-  thread: { messages?: { labelIds?: string[]; internalDate?: string }[] },
+  thread: { messages?: { labelIds?: string[] }[] },
   tagId: string | null,
-  before: number,
-): { tagged: boolean; ours: boolean } {
+): { tagged: boolean; starred: boolean } {
   return {
     tagged: Boolean(tagId) && threadHasLabel(thread, tagId!),
-    ours: (thread.messages ?? []).some((m) => (m.labelIds ?? []).includes('SENT') && Number(m.internalDate) < before),
+    starred: threadHasLabel(thread, 'STARRED'),
   }
 }
 

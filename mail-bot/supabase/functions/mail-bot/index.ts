@@ -28,7 +28,6 @@ import {
   isQuiet,
   laterKeyboard,
   laterTime,
-  loadMark,
   MONEY_WORDS,
   muteEntry,
   parseQuiet,
@@ -130,7 +129,7 @@ const HELP = [
   '/senders: who may send you money emails (✓ Allow on a new sender adds them)',
   '📌 Put the Gmail label "erbol" on any email and it comes here, whatever the filters. New replies in that ' +
   'conversation come too.',
-  '💬 A reply in a conversation your inbox wrote in always comes, whatever the filters (not for loads).',
+  '⭐ Star an email in Gmail and its new replies come here too, whatever the filters.',
   '/filter: per inbox: templates only, extra words, or all emails',
   '/skipped: emails that fit no template (the daily list)',
   '/muted: what you stopped with 🔕, tap to undo',
@@ -652,12 +651,12 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
   if (shouldSkip(email.labelIds, SKIP_CATEGORIES)) return false
   if (email.from.email === ib.email) return false // mail you sent to yourself
   if (isMuted(ctx.muted, email.from.email, email.subject)) return false
-  // A reply is never skipped when it answers you: in a conversation you tagged (it comes like a
-  // tagged email), or one this inbox wrote in. Load conversations stay out, like all load emails.
+  // A new reply in a conversation you tagged or starred in Gmail is never skipped, even about a load:
+  // you marked it to follow. It gets the "no reply yet" check, like a tagged email.
   const convo = await conversation(ib, email)
-  if (convo.tagged || (convo.ours && !loadMark(email.subject))) {
-    const prefix = convo.tagged ? '📌 ' + ctx.tag + ' · reply' : '💬 Reply'
-    await afterPost(ib, email, ctx, convo.tagged, await postCard(ib, email, chat, ctx, 'min', prefix))
+  if (convo.tagged || convo.starred) {
+    const prefix = convo.tagged ? '📌 ' + ctx.tag + ' · reply' : '⭐ Starred · reply'
+    await afterPost(ib, email, ctx, true, await postCard(ib, email, chat, ctx, 'min', prefix))
     return true
   }
   const d = decide(email, ctx.people, ib.keywords, ctx.senders)
@@ -687,17 +686,16 @@ async function deliver(ib: Inbox, id: string, chat: string, ctx: Ctx, tagged = f
 }
 
 /**
- * For a reply: is its conversation tagged, and did this inbox write in it
- * before? Gmail puts the tag only on the emails that were there when you
- * tagged it; the replies after it come without the tag, so this looks at the
- * whole conversation. Removing the tag in Gmail stops it. Errors throw, so the
- * email is tried again next minute instead of landing in the daily list.
+ * For a reply: did you tag or star its conversation? Gmail puts the tag and
+ * the star only on the emails you marked; the replies after them come without,
+ * so this looks at the whole conversation. Removing the tag and the star in
+ * Gmail stops it. Errors throw, so the email is tried again next minute
+ * instead of landing in the daily list.
  */
-async function conversation(ib: Inbox, email: Email): Promise<{ tagged: boolean; ours: boolean }> {
+async function conversation(ib: Inbox, email: Email): Promise<{ tagged: boolean; starred: boolean }> {
   // A conversation's id is its first email's id: a first email is nobody's reply.
-  if (email.threadId === email.id) return { tagged: false, ours: false }
-  const thread = await gmail(ib, `threads/${email.threadId}?format=minimal`)
-  return conversationOf(thread, ib.tag_label_id, email.date.getTime())
+  if (email.threadId === email.id) return { tagged: false, starred: false }
+  return conversationOf(await gmail(ib, `threads/${email.threadId}?format=minimal`), ib.tag_label_id)
 }
 
 /**

@@ -732,22 +732,16 @@ Deno.test('a tagged conversation: new replies come without the tag, but the conv
   assert.ok(!threadHasLabel({}, 'Label_1'))
 })
 
-Deno.test('a reply answers you when this inbox wrote in the conversation before it', () => {
-  // The T-Mobile chain: you wrote at 14:59 and 16:00; Dre replied at 15:22, 16:32 and 16:34.
-  const thread = {
-    messages: [
-      { labelIds: ['Label_1', 'SENT'], internalDate: '1000' },
-      { labelIds: ['Label_1', 'INBOX'], internalDate: '2000' },
-      { labelIds: ['SENT'], internalDate: '3000' },
-      { labelIds: ['INBOX'], internalDate: '4000' },
-    ],
-  }
-  assert.deepEqual(conversationOf(thread, 'Label_1', 4000), { tagged: true, ours: true })
-  assert.deepEqual(conversationOf(thread, null, 4000), { tagged: false, ours: true })
-  // Someone else started it and you never wrote: not yours.
-  const theirs = { messages: [{ labelIds: ['INBOX'], internalDate: '1000' }, { labelIds: ['INBOX'], internalDate: '2000' }] }
-  assert.deepEqual(conversationOf(theirs, 'Label_1', 2000), { tagged: false, ours: false })
-  // You wrote only after this email: it isn't an answer to you.
-  const later = { messages: [{ labelIds: ['INBOX'], internalDate: '1000' }, { labelIds: ['SENT'], internalDate: '5000' }] }
-  assert.deepEqual(conversationOf(later, null, 1000), { tagged: false, ours: false })
+Deno.test('replies to follow: the conversation is tagged or starred, though the new reply carries neither', () => {
+  // The T-Mobile chain: tagged at 15:27; Dre's replies at 16:32 and 16:34 came without the tag.
+  const tagged = { messages: [{ labelIds: ['Label_1', 'SENT'] }, { labelIds: ['Label_1', 'INBOX'] }, { labelIds: ['INBOX'] }] }
+  assert.deepEqual(conversationOf(tagged, 'Label_1'), { tagged: true, starred: false })
+  // Starring a conversation in Gmail stars one email in it.
+  const starred = { messages: [{ labelIds: ['INBOX', 'STARRED'] }, { labelIds: ['SENT'] }, { labelIds: ['INBOX', 'UNREAD'] }] }
+  assert.deepEqual(conversationOf(starred, 'Label_1'), { tagged: false, starred: true })
+  assert.deepEqual(conversationOf(starred, null), { tagged: false, starred: true })
+  // Just a conversation you wrote in: not followed.
+  const plain = { messages: [{ labelIds: ['SENT'] }, { labelIds: ['INBOX'] }] }
+  assert.deepEqual(conversationOf(plain, 'Label_1'), { tagged: false, starred: false })
+  assert.deepEqual(conversationOf({}, 'Label_1'), { tagged: false, starred: false })
 })
