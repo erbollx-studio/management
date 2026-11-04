@@ -563,7 +563,8 @@ const LOAD_SUBJECTS = [
   /\bpick[\s-]?up\b/i,
   /\bPU\b/,
   /\bscale ticket|\btonu\b|\bdetention\b|\blumper\b/i,
-  new RegExp('\\b(' + REGIONS + ')\\b\\s*(to|TO|To|→|>>|->|–|—|-)\\s*([A-Za-z .\'-]{0,30},?\\s*)?\\b(' + REGIONS + ')\\b'),
+  /\bpro\s*(#|no\.?|number)\s*\(?\d/i,
+  new RegExp('\\b(' + REGIONS + ')\\b\\s*(to|TO|To|→|>>|->|>|–|—|-)\\s*([A-Za-z .\'-]{0,30},?\\s*)?\\b(' + REGIONS + ')\\b'),
 ]
 
 /** The load words in a subject ("Load #8646459", "Rate Confirmation", "NV to Rocklin, CA"), or ''. */
@@ -827,6 +828,22 @@ export function isNoReply(address: string): boolean {
 /** Whether any email in a Gmail conversation (threads/{id}?format=minimal) has the label `labelId`. */
 export function threadHasLabel(thread: { messages?: { labelIds?: string[] }[] }, labelId: string): boolean {
   return (thread.messages ?? []).some((m) => (m.labelIds ?? []).includes(labelId))
+}
+
+/**
+ * What a reply's conversation (threads/{id}?format=minimal) tells: `tagged`,
+ * an email in it has the tag label; `ours`, this inbox wrote in it before the
+ * reply came (a sent email earlier than `before`, in ms), so it answers you.
+ */
+export function conversationOf(
+  thread: { messages?: { labelIds?: string[]; internalDate?: string }[] },
+  tagId: string | null,
+  before: number,
+): { tagged: boolean; ours: boolean } {
+  return {
+    tagged: Boolean(tagId) && threadHasLabel(thread, tagId!),
+    ours: (thread.messages ?? []).some((m) => (m.labelIds ?? []).includes('SENT') && Number(m.internalDate) < before),
+  }
 }
 
 /** Whether the conversation (a Gmail thread, format=minimal) has a sent message after `since` (ms). */

@@ -47,6 +47,7 @@ import {
   isNoReply,
   answeredAfter,
   threadHasLabel,
+  conversationOf,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -301,6 +302,9 @@ const loadSubjects = [
   'Invoice for lumper receipt, load 4411',
   'POD and BOL attached',
   'Pick-up tomorrow 8am',
+  'Re: ITS PRO # 5097814 / 5085460 - Shippensburg, PA > Hagerstown, MD > Pedricktow',
+  'Re: $$$ ITS PRO# (5086723 - 5085940) // EASTVALE, CA > PEDRICKTOWN, NJ // 10/29',
+  'Re: 971684 Seattle, WA - Aurora, CO 11/4',
 ]
 const moneySubjects = [
   'You just received a payment from eCapital!💰🎉',
@@ -726,4 +730,24 @@ Deno.test('a tagged conversation: new replies come without the tag, but the conv
   assert.ok(!threadHasLabel(thread, 'Label_9'))
   assert.ok(!threadHasLabel({ messages: [{ labelIds: ['INBOX'] }, {}] }, 'Label_1'))
   assert.ok(!threadHasLabel({}, 'Label_1'))
+})
+
+Deno.test('a reply answers you when this inbox wrote in the conversation before it', () => {
+  // The T-Mobile chain: you wrote at 14:59 and 16:00; Dre replied at 15:22, 16:32 and 16:34.
+  const thread = {
+    messages: [
+      { labelIds: ['Label_1', 'SENT'], internalDate: '1000' },
+      { labelIds: ['Label_1', 'INBOX'], internalDate: '2000' },
+      { labelIds: ['SENT'], internalDate: '3000' },
+      { labelIds: ['INBOX'], internalDate: '4000' },
+    ],
+  }
+  assert.deepEqual(conversationOf(thread, 'Label_1', 4000), { tagged: true, ours: true })
+  assert.deepEqual(conversationOf(thread, null, 4000), { tagged: false, ours: true })
+  // Someone else started it and you never wrote: not yours.
+  const theirs = { messages: [{ labelIds: ['INBOX'], internalDate: '1000' }, { labelIds: ['INBOX'], internalDate: '2000' }] }
+  assert.deepEqual(conversationOf(theirs, 'Label_1', 2000), { tagged: false, ours: false })
+  // You wrote only after this email: it isn't an answer to you.
+  const later = { messages: [{ labelIds: ['INBOX'], internalDate: '1000' }, { labelIds: ['SENT'], internalDate: '5000' }] }
+  assert.deepEqual(conversationOf(later, null, 1000), { tagged: false, ours: false })
 })

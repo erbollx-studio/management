@@ -30,10 +30,17 @@ email sent nearly every one of them to the chat.
 ## What comes to the chat
 
 1. 📌 **Tagged** emails, 🔴 **urgent insurance** and ⭐ **your people**: always.
+   **💬 Replies to you** too: a reply in a conversation the inbox wrote in
+   before comes marked `💬 Reply`, whatever the templates, the money list and
+   `/filter` say (🔕 still stops it). Load conversations stay out (rule 2).
+   On 3 Nov two replies from T-Mobile support in a conversation the inbox
+   started went to the daily list; that can't happen now. In a day of real
+   mail this adds about 3 emails: 13 replies to the inboxes, 10 of them loads.
 2. 🚚 **Load emails: never**, even when they say "payment". A load email is
    one whose subject has a load or PO number, "rate confirmation", "delivery
-   receipt", BOL, POD, tender, pickup, TONU, detention, lumper, or a lane
-   like "Las Vegas, NV to Rocklin, CA" / "CA-NV" (`LOAD_SUBJECTS` in `mail.ts`).
+   receipt", BOL, POD, tender, pickup, TONU, detention, lumper, a PRO #, or a
+   lane like "Las Vegas, NV to Rocklin, CA" / "EASTVALE, CA > PEDRICKTOWN, NJ" /
+   "CA-NV" (`LOAD_SUBJECTS` in `mail.ts`).
 3. 💵 **Money emails (🧾 💰) only from allowed senders**, the money list
    (`/senders`). It goes by company domain, so allowing `ecapital.com` covers
    wallet@, reports@ and every other eCapital address. A money email from a
