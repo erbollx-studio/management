@@ -48,6 +48,10 @@ import {
   answeredAfter,
   threadHasLabel,
   conversationOf,
+  describeSender,
+  learnedType,
+  TYPE_PREFIX,
+  typeKey,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -364,6 +368,84 @@ Deno.test('decide: 🔴 and ⭐ always, loads never, money only from allowed sen
   // The inbox's own words come, except on load emails.
   assert.equal(decide(email('Hi Erbol', 'Erbol, call me', 'x@y.com'), [], ['erbol'], {}).send, 'chat')
   assert.equal(decide(email('Load #12 for Erbol', 'Erbol', 'x@y.com'), [], ['erbol'], {}).send, 'list')
+})
+
+Deno.test('a type of email: numbers, dates, month and day names, am/pm, Re: and Fwd: don\'t count', () => {
+  assert.equal(typeKey('Your weekly fuel savings report #45'), 'your weekly fuel savings report ##')
+  assert.equal(typeKey('Re: Fwd: Your weekly fuel savings report #146'), typeKey('Your weekly fuel savings report #45'))
+  assert.equal(typeKey('Fuel savings for Oct 30, 2026'), typeKey('Fuel savings for November 6, 2026'))
+  assert.equal(typeKey('Fuel savings Mon, Nov 2 at 10:46 AM'), typeKey('Fuel savings Tue, Nov 3 at 9:00 PM'))
+  assert.notEqual(typeKey('Your weekly fuel savings report #45'), typeKey('Your weekly toll report #45'))
+  // 🔕 keeps its own key, so the mutes already saved still match.
+  assert.equal(subjectKey('Fuel savings for Oct 30'), 'fuel savings for oct #')
+})
+
+Deno.test('✕ Not money learns a subject only when it has two words of its own besides money and plain words', () => {
+  for (const s of ['Your weekly fuel savings report #45', 'Save 15% on truck insurance this month',
+    'Get paid faster with Mudflap fuel card', 'Invoice 1234 from ABC Trucking']) {
+    assert.equal(learnedType(s), typeKey(s), s)
+  }
+  // Real money looks like these, from anyone: learning them would hide real invoices.
+  for (const s of ['Invoice INV-2231 for Load 4411', 'Remittance advice from eCapital',
+    'Final notice: policy #A-4411 past due', 'Invoice 4411', 'Payment received', 'Payment reminder',
+    'Download your statement', 'You just received a payment from eCapital!💰🎉', 'Weekly settlement report',
+    'Settlement Summary for check date 10/23/2026', 'Your eCapital Account Payment History Report',
+    'PAYMENT RECEIVED IN FULL - OK', 'Premium invoice for policy #4411', 'Your Samsara invoice is ready',
+    'Action required: Your payment is past due', 'City of Markham, IL Invoice# 73000390002-11052026 Reminder',
+    'Invoice file of customer 5216686 generated for the billing period', 'Оплата страховки за октябрь', '']) {
+    assert.equal(learnedType(s), null, s)
+  }
+  assert.equal(describeSender(TYPE_PREFIX + 'your weekly fuel savings report ##'),
+    'emails like "your weekly fuel savings report ##"')
+  assert.equal(describeSender('nicusa.com'), 'nicusa.com')
+  // A learned type never reads as a sender.
+  assert.equal(senderStatus({ [TYPE_PREFIX + 'x y']: 'denied' }, 'ap@xy.com'), undefined)
+})
+
+Deno.test('decide: a learned type sends money like it to the daily list, from anyone; never 🔴, ⭐ or allowed', () => {
+  const email = (subject: string, body: string, sender: string) => {
+    const e = readEmail(message())
+    e.subject = subject
+    e.text = body
+    e.from = parseAddress(sender)
+    e.attachments = []
+    return e
+  }
+  const fuel = 'Your fuel card statement is ready. Payment is due Nov 10.'
+  const people = [{ entry: 'anna@truckinsure.com', name: 'Anna Lee', note: '' }]
+  // You tapped ✕ Not money on "Your weekly fuel savings report #45" from fleetone.com.
+  const tapped = email('Your weekly fuel savings report #45', fuel, 'reports@fleetone.com')
+  const senders: Record<string, string> = {
+    'ecapital.com': 'allowed',
+    [senderEntry(tapped.from.email)]: 'denied',
+    [TYPE_PREFIX + learnedType(tapped.subject)!]: 'denied',
+  }
+  const go = (e: ReturnType<typeof email>, rules: string[] = []) => decide(e, people, rules, senders)
+
+  assert.equal(go(email('Your weekly fuel savings report #46', fuel, 'reports@fleetone.com')).send, 'list')
+  // The same type from another company goes to the daily list too, without asking.
+  const other = go(email('Fwd: Your weekly fuel savings report #12', fuel, 'noreply@wexinc.com'))
+  assert.deepEqual([other.send, other.learned, other.asking], ['list', 'your weekly fuel savings report ##', true])
+  // Never: allowed senders, your people, 🔴 urgent insurance, the inbox's own words.
+  assert.equal(go(email('Your weekly fuel savings report #46', fuel, 'reports@ecapital.com')).send, 'chat')
+  assert.equal(go(email('Your weekly fuel savings report #46', fuel, 'anna@truckinsure.com')).send, 'chat')
+  assert.equal(go(email('Your weekly fuel savings report #46', 'Your insurance policy lapsed on Nov 1.',
+    'noreply@wexinc.com')).send, 'chat')
+  assert.equal(go(email('Your weekly fuel savings report #46', fuel, 'noreply@wexinc.com'), ['fuel']).send, 'ask')
+  // Money routing only: without money words it follows the usual rules.
+  const plain = go(email('Your weekly fuel savings report #46', 'Great week!', 'noreply@wexinc.com'), ['great week'])
+  assert.deepEqual([plain.send, plain.learned], ['chat', ''])
+  // Real money from new senders still asks; a load email stays out as always, not because of learning.
+  for (const s of ['Invoice INV-2231', 'Remittance advice from eCapital', 'Your weekly toll report #45']) {
+    assert.equal(go(email(s, 'Payment of $2,450 is attached.', 'ar@newbroker.com')).send, 'ask', s)
+  }
+  const load = go(email('Invoice INV-2231 for Load 4411', 'Payment of $2,450.', 'ar@newbroker.com'))
+  assert.deepEqual([load.send, load.load, load.learned], ['list', 'Load 4411', ''])
+  // A type too common to learn is ignored even if it got on the list some other way.
+  senders[TYPE_PREFIX + typeKey('Invoice 4411')] = 'denied'
+  senders[TYPE_PREFIX + typeKey('Final notice: policy #A-4411 past due')] = 'denied'
+  assert.equal(go(email('Invoice 2231', 'Please pay by Friday.', 'ar@newbroker.com')).send, 'ask')
+  assert.equal(go(email('Final notice: policy #A-9000 past due', 'Your premium is late.', 'x@ins.com')).send, 'chat')
 })
 
 Deno.test('time: the clock in Bishkek, and moments from it', () => {

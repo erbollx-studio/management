@@ -49,6 +49,26 @@ email sent nearly every one of them to the chat.
    **✓ Allow** and **✕ Not money**. Until you answer, their next money emails
    wait in the daily list. Tap a name in `/senders` to forget it, and the next
    one asks again.
+
+   **✕ Not money learns two things.** The sender's company: their money
+   emails go to the daily list. And the type of email: its subject without
+   numbers, dates, month and day names, Re: and Fwd: ("Your weekly fuel
+   savings report #45" → `your weekly fuel savings report ##`). Money emails
+   with that subject from **anyone** go to the daily list too, without the
+   🆕 question. The toast says what it learned: `✕ Not money: nicusa.com, and
+   emails like "Your weekly fuel savings report #45" from anyone`.
+   - Only a clear subject is learned: it needs two words of its own besides
+     money words and plain ones like "your", "invoice", "report", "weekly",
+     "account" (`learnedType` in `mail.ts`). "Invoice 4411", "Payment
+     received", "Download your statement", "Remittance advice from eCapital"
+     or "Final notice: policy #A-4411 past due" are never learned: real money
+     from anyone looks like that. Single words like "invoice" are never learned.
+   - A learned type never stops 🔴 urgent insurance, ⭐ your people, 📌 tagged
+     or ⭐ starred conversations, senders you allowed, an email with the
+     inbox's own `/filter` words, or an inbox set to all emails. It only moves
+     money emails to the daily list; it never deletes or hides one.
+   - `/senders` lists the learned types; tap one to forget it. They are rows
+     in `mailbot_senders` with entry `subject:` + the subject and status `denied`.
 4. The inbox's own words (`/filter`), unless it's a load email.
 5. Everything else: the daily list.
 
@@ -161,7 +181,7 @@ On top of the templates, an inbox can let through emails with its own words.
 | `/templates` | The templates and their words |
 | `/people` | Your ⭐ people; tap one to remove |
 | `/people name@company.com Anna Lee, insurance agent` | Add a person (or `company.com` for everyone there) |
-| `/senders` | The money list: allowed, asked, not money; tap one to forget it |
+| `/senders` | The money list: allowed, asked, not money, and the types ✕ Not money learned; tap one to forget it |
 | `/filter` | Per inbox: templates only, extra words, or all emails |
 | `/filter name@company.com erbol, load 4411` | The same in one command; `all` or `templates` switch the mode |
 | `/skipped` | Emails that fit no template |

@@ -13,6 +13,7 @@ import {
   decide,
   decodeEntities,
   describeMute,
+  describeSender,
   dueLine,
   type Email,
   emailKeyboard,
@@ -28,6 +29,7 @@ import {
   isQuiet,
   laterKeyboard,
   laterTime,
+  learnedType,
   MONEY_WORDS,
   muteEntry,
   parseQuiet,
@@ -43,6 +45,7 @@ import {
   similarWords,
   stopKeyboard,
   taggedIds,
+  TYPE_PREFIX,
   conversationOf,
   URGENT_WORDS,
   type Attachment,
@@ -1129,11 +1132,16 @@ async function peopleList(): Promise<{ text: string; markup: { inline_keyboard: 
   }
 }
 
-/** /senders: the money list. Tapping one forgets it, so their next money email asks again. */
+/**
+ * /senders: the money list, then the types of email ✕ Not money learned.
+ * Tapping one forgets it: a sender's next money email asks again, and a
+ * type's emails follow the usual rules again.
+ */
 async function sendersList(): Promise<{ text: string; markup: { inline_keyboard: Button[][] } }> {
   const { data, error } = await db.from('mailbot_senders').select('id, entry, status').order('created_at')
   if (error) throw new Error('senders: ' + error.message)
-  const all = data ?? []
+  const all = (data ?? []).filter((s) => !s.entry.startsWith(TYPE_PREFIX))
+  const types = (data ?? []).filter((s) => s.entry.startsWith(TYPE_PREFIX))
   const group = (status: string, title: string) => {
     const entries = all.filter((s) => s.status === status).map((s) => esc(s.entry))
     return entries.length ? [title + ' ' + entries.join(', ')] : []
@@ -1145,10 +1153,15 @@ async function sendersList(): Promise<{ text: string; markup: { inline_keyboard:
     ...group('asked', '⏳ Asked, no answer yet:'),
     ...group('denied', '✕ Not money:'),
     ...(all.length ? [] : ['Nobody yet.']),
+    ...(types.length
+      ? ['', '✕ <b>Not money, from anyone</b> (# is any number). These go to the daily list. ' +
+        '🔴, ⭐, 📌 and allowed senders still come.', ...types.map((s) => '• ' + esc(describeSender(s.entry)))]
+      : []),
     '',
-    'A new sender comes once, with ✓ Allow. Tap a name below to forget it.',
+    'A new sender comes once, with ✓ Allow. Tap one below to forget it.',
   ].join('\n')
-  const rows = all.slice(0, 50).map((s) => [{ text: '✖ ' + clip(s.entry, 50), callback_data: 'L:' + s.id }])
+  const rows = [...all, ...types].slice(0, 50)
+    .map((s) => [{ text: '✖ ' + clip(describeSender(s.entry), 50), callback_data: 'L:' + s.id }])
   return { text, markup: { inline_keyboard: [...rows, [{ text: '🗑', callback_data: 'X' }]] } }
 }
 
@@ -1247,7 +1260,11 @@ async function onCallback(cfg: Config, q: any): Promise<void> {
       await edit(chat, messageId, list.text, list.markup)
     } else if (act === 'L') {
       const { data: gone } = await db.from('mailbot_senders').delete().eq('id', Number(a)).select('entry').maybeSingle()
-      if (gone) toast = 'Forgot ' + gone.entry + '. Their next money email asks again.'
+      if (gone) {
+        toast = gone.entry.startsWith(TYPE_PREFIX)
+          ? 'Forgot ' + describeSender(gone.entry) + '. They follow the usual rules again.'
+          : 'Forgot ' + gone.entry + '. Their next money email asks again.'
+      }
       const list = await sendersList()
       await edit(chat, messageId, list.text, list.markup)
     } else if (act === 'y' || act === 'Y') {
@@ -1332,8 +1349,18 @@ async function onEmailButton(cfg: Config, q: any, act: string, ib: Inbox, id: st
       const entry = senderEntry(email.from.email)
       await db.from('mailbot_senders').upsert({ entry, status: act === 'G' ? 'allowed' : 'denied' }, { onConflict: 'entry' })
       if (act === 'B') {
+        // It also learns the type, so money emails like this one from other senders stop asking too.
+        // Only a subject clear enough to be one template: never "Invoice 4411" (learnedType in mail.ts).
+        const type = learnedType(email.subject)
+        if (type) {
+          const { error } = await db.from('mailbot_senders')
+            .upsert({ entry: TYPE_PREFIX + type, status: 'denied' }, { onConflict: 'entry' })
+          if (error) throw new Error('learn: ' + error.message)
+        }
         await remove(chat, messageId)
-        return entry + ': money emails go to the daily list. /senders to change it.'
+        return '✕ Not money: ' + entry + (type
+          ? ', and emails like "' + clip(email.subject, 50) + '" from anyone (daily list). /senders to undo.'
+          : '. The subject is too common to learn from. /senders to undo.')
       }
       const ctx = await loadCtx(cfg)
       const card = renderCard(ib, email, ctx, 'min', '', await deadlineOf(ib, email, ctx))

@@ -592,6 +592,91 @@ export function senderStatus(senders: Record<string, string>, email: string): st
   return undefined
 }
 
+// ---------------------------------------------------- learned not-money types --
+
+/**
+ * ✕ Not money also learns the type of email, kept on the money list as
+ * "subject:" + its typeKey with status denied. No address or domain has a ":",
+ * so these never mix with senders.
+ */
+export const TYPE_PREFIX = 'subject:'
+
+/** Month and weekday names, so "Report for Oct 30" and "Report for Nov 6" are the same type. */
+const DATE_NAMES = new RegExp('\\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|' +
+  'sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|monday|tuesday|wednesday|thursday|friday|' +
+  'saturday|sunday|(?:mon|tues?|wed|thu(?:rs?)?|fri|sat|sun)(?=,))\\b\\.?', 'gi')
+
+/**
+ * A subject as a type of email: subjectKey (no numbers, dates, Re: or Fwd:)
+ * with month and weekday names and am/pm also taken out. A separate function,
+ * so the 🔕 mutes you already have keep matching.
+ */
+export function typeKey(subject: string): string {
+  return subjectKey(subject.replace(/(\d)\s*[ap]\.?m\.?(?![a-z])/gi, '$1').replace(DATE_NAMES, '0'))
+}
+
+/**
+ * Words that don't tell one kind of email from another: real invoices and
+ * payment notices from anyone are full of them. They don't count toward a
+ * learned type, and neither do the money, insurance and urgent words.
+ */
+const PLAIN_WORDS = new Set([
+  'the', 'and', 'for', 'from', 'with', 'your', 'you', 'our', 'its', 'has', 'have', 'had', 'been', 'are', 'was',
+  'were', 'will', 'can', 'this', 'that', 'here', 'there', 'now', 'new', 'just', 'all', 'any', 'not', 'off', 'out',
+  'per', 'via', 'about', 'into', 'get', 'got', 'see', 'view', 'please', 'pls', 'thank', 'thanks', 'dear', 'hello',
+  'regarding', 'attn', 'fyi', 'inc', 'llc', 'ltd', 'corp', 'company', 'team', 'dept', 'office', 'com', 'net', 'org',
+  'www', 'info', 'information', 'important', 'action', 'required', 'urgent', 'update', 'updated', 'reminder',
+  'notice', 'notification', 'alert', 'confirmation', 'confirmed', 'confirm', 'request', 'requested', 'ready',
+  'available', 'attached', 'attachment', 'copy', 'document', 'documents', 'docs', 'pdf', 'file', 'files',
+  'generated', 'change', 'changed', 'address', 'invoice', 'inv', 'bill', 'bills', 'billing', 'due', 'amount',
+  'balance', 'total', 'paid', 'pay', 'unpaid', 'outstanding', 'overdue', 'past', 'received', 'receive', 'sent',
+  'send', 'processed', 'processing', 'scheduled', 'pending', 'approved', 'approval', 'declined', 'failed', 'status',
+  'summary', 'report', 'reports', 'details', 'detail', 'advice', 'account', 'acct', 'customer', 'client', 'vendor',
+  'carrier', 'number', 'ref', 'reference', 'period', 'date', 'check', 'cheque', 'deposit', 'direct', 'transfer',
+  'wire', 'funds', 'fund', 'transaction', 'transactions', 'order', 'purchase', 'credit', 'debit', 'card', 'bank',
+  'online', 'auto', 'autopay', 'final', 'open', 'closed', 'quote', 'today', 'weekly', 'monthly', 'daily', 'annual',
+  'yearly', 'quarterly', 'week', 'month', 'year', 'full', 'partial', 'fee', 'fees', 'charge', 'charges', 'cost',
+  'rate', 'price', 'tax', 'taxes', 'owed', 'money', 'cash', 'load', 'loads', 'policy', 'policies', 'renewal',
+  'certificate', 'holder', 'history', 'submission', 'submitted', 'made', 'completed', 'complete', 'successful',
+  'non', 'city', 'state', 'county', 'ваш', 'ваша', 'ваше', 'для', 'новый', 'новая', 'напоминание', 'уведомление',
+  'отчет', 'документ', 'документы', 'акт', 'сверки', 'сумма', 'долг', 'задолженность', 'месяц', 'год',
+])
+
+/** Money, insurance and urgent words, the template lists and the filter families together. */
+const MONEY_LIKE = [...MONEY_WORDS, ...INSURANCE_WORDS, ...URGENT_WORDS, ...FAMILIES[0], ...FAMILIES[1]]
+
+/**
+ * The type ✕ Not money learns from an email: its typeKey ("your weekly fuel
+ * savings report ##"), for money emails from anyone. Only when the subject has
+ * at least two words of its own besides money words and plain ones ("fuel",
+ * "savings"): an exact subject like that is one sender's template. null for
+ * "Invoice 4411", "Payment received", "Download your statement" or
+ * "Remittance advice from eCapital": real money emails from others look just
+ * like those, so learning them would hide real money.
+ */
+export function learnedType(subject: string): string | null {
+  const key = typeKey(subject)
+  const own = new Set(fold(key).split(/[^\p{L}]+/u).filter((w) =>
+    w.length >= 3 && !PLAIN_WORDS.has(w) && !firstWord(w, MONEY_LIKE)
+  ))
+  return own.size >= 2 ? key : null
+}
+
+/** A money-list entry in words: the sender, or 'emails like "…"' for a learned type. */
+export function describeSender(entry: string): string {
+  return entry.startsWith(TYPE_PREFIX) ? 'emails like "' + entry.slice(TYPE_PREFIX.length) + '"' : entry
+}
+
+/**
+ * The learned type this email is, or ''. The inbox's own /filter words beat
+ * it: you asked for those emails by name.
+ */
+function learnedMatch(email: Email, rules: string[], senders: Record<string, string>): string {
+  const key = typeKey(email.subject)
+  if (!key || senders[TYPE_PREFIX + key] !== 'denied' || learnedType(email.subject) !== key) return ''
+  return rules.length && matchRules(email, rules).pass ? '' : key
+}
+
 export interface Decision extends Verdict {
   /** chat: post it. ask: post it once, with ✓ Allow / ✕ Not money. list: the daily list. */
   send: 'chat' | 'ask' | 'list'
@@ -601,6 +686,8 @@ export interface Decision extends Verdict {
   asking: boolean
   /** The load words that keep it out, or ''. */
   load: string
+  /** The type you marked ✕ Not money that sent it to the daily list ("your weekly fuel savings report ##"), or ''. */
+  learned: string
 }
 
 /**
@@ -608,18 +695,25 @@ export interface Decision extends Verdict {
  * Load emails never do, even when they say "payment". 💰 and 🧾 money emails
  * come only from senders on the money list (`senders`: entry → allowed,
  * asked or denied); a sender with no entry is asked about once, after that
- * their money emails wait for the answer in the daily list. The inbox's own
- * words come too, unless it's a load email. Everything else: the daily list.
+ * their money emails wait for the answer in the daily list. A new sender's
+ * money email of a type you marked ✕ Not money goes to the daily list without
+ * asking; allowed senders and the inbox's own words beat the type. The
+ * inbox's own words come too, unless it's a load email. Everything else: the
+ * daily list.
  */
 export function decide(email: Email, people: Person[], rules: string[], senders: Record<string, string>): Decision {
   const v = classify(email, people, rules)
-  const base = { ...v, sender: senderEntry(email.from.email), load: loadMark(email.subject), asking: false }
+  const sender = senderEntry(email.from.email)
+  const base = { ...v, sender, load: loadMark(email.subject), asking: false, learned: '' }
   if (v.kind === 'urgent' || personFor(people, email.from.email)) return { ...base, send: 'chat' }
   if (v.kind === 'none' || base.load) return { ...base, send: 'list' }
   if (v.kind === 'money' || v.kind === 'insurance') {
     const status = senderStatus(senders, email.from.email)
     if (status === 'allowed') return { ...base, send: 'chat' }
     if (status === 'denied') return { ...base, send: 'list' }
+    // Still asking: if this card ever shows (an inbox on "all emails"), ✓ Allow is there.
+    const learned = status ? '' : learnedMatch(email, rules, senders)
+    if (learned) return { ...base, send: 'list', asking: true, learned }
     return { ...base, send: status === 'asked' ? 'list' : 'ask', asking: true }
   }
   return { ...base, send: 'chat' }
