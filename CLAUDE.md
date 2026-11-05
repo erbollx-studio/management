@@ -12,3 +12,18 @@ Standing rules from the owner. Follow these in every task.
 8. Privacy. Do not put bank account numbers, SSNs, or full card numbers into the database. Last 4 digits only.
 9. Tell me what you did in plain, simple words: what was read, what was written, how many rows, and what needs my attention. No emojis. Do not use long dashes.
 10. If you are unsure about anything, ask me one clear question instead of guessing.
+
+## How the agents work
+
+The roles, the order they run in, and the handoff format are in `docs/insurance/agent-roles.md`. The agent files are in `.claude/agents/`. The build package is in `docs/insurance/build-package/`.
+
+For the main session (the coordinator):
+- Only you talk to the user, hold approvals, start agents, and publish.
+- Give each job to its role. Do not read bills or write ledger rows yourself.
+- One approval covers one batch, identified by the sha256 of its `batch.json`.
+
+For agents:
+- You cannot ask the user. Where a rule says "show me" or "ask me", stop and put it in your final report to the coordinator.
+- Never act as if something was approved unless the coordinator's message says APPROVED for that exact item.
+- Stay inside your role. If the task needs a tool you do not have, stop and report it.
+- Work files go in `work/`, which is git-ignored. Never commit them. They hold names and amounts.
