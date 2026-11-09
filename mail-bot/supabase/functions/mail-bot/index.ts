@@ -1110,9 +1110,10 @@ async function cmdUnread(cfg: Config, chat: string): Promise<void> {
   const lines = ['📬 <b>Unread</b> (about ' + total + '). Newest first, tap a number to open one here.', '']
   const buttons: Button[] = []
   items.forEach(({ ib, email }, i) => {
-    lines.push((i + 1) + '. <a href="' + esc(gmailLink(ib.email, email.id)) + '">' +
-      esc(clip(email.subject || '(no subject)', 80)) + '</a>')
-    lines.push('     ' + esc(email.from.label) + ' → ' + esc(ib.label || ib.email) + ' · ' + fmtDate(email.date, tz))
+    // The subject is <code>, so a tap copies it; ↗ Gmail opens the email.
+    lines.push((i + 1) + '. <code>' + esc(clip(email.subject || '(no subject)', 80)) + '</code>')
+    lines.push('     ' + esc(email.from.label) + ' → ' + esc(ib.label || ib.email) + ' · ' + fmtDate(email.date, tz) +
+      ' · <a href="' + esc(gmailLink(ib.email, email.id)) + '">↗ Gmail</a>')
     buttons.push({ text: String(i + 1), callback_data: `o:${ib.id}:${email.id}` })
   })
   const rows: Button[][] = []
@@ -1783,8 +1784,10 @@ async function sendDigest(cfg: Config, chat: string, scheduled: boolean): Promis
   ]
   for (const r of shown) {
     const inbox = emailOf.get(r.inbox_id) ?? ''
-    lines.push('• <a href="' + esc(gmailLink(inbox, r.message_id)) + '">' + esc(clip(r.subject || '(no subject)', 60)) + '</a>')
-    lines.push('   ' + esc(clip(r.sender, 30)) + ' → ' + esc(inbox) + ' · ' + fmtDate(new Date(r.received_at), tz))
+    // The subject is <code>, so a tap copies it; ↗ Gmail opens the email.
+    lines.push('• <code>' + esc(clip(r.subject || '(no subject)', 60)) + '</code>')
+    lines.push('   ' + esc(clip(r.sender, 30)) + ' → ' + esc(inbox) + ' · ' + fmtDate(new Date(r.received_at), tz) +
+      ' · <a href="' + esc(gmailLink(inbox, r.message_id)) + '">↗ Gmail</a>')
   }
   const res = await send(chat, lines.join('\n'), TRASH)
   if (res.ok) {

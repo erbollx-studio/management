@@ -210,7 +210,8 @@ On top of the templates, an inbox can let through emails with its own words.
 - **Similar words count too.** `payment` also finds invoice, paid, remittance,
   «оплата», «счёт». The lists are `FAMILIES` in `mail.ts`.
 - Held-back emails aren't lost: the bot sends a list of them every day at
-  20:00 (Bishkek), and `/skipped` shows it any time.
+  20:00 (Bishkek), and `/skipped` shows it any time. Tap a subject there to
+  copy it; ↗ Gmail opens the email.
 
 ## Commands
 
