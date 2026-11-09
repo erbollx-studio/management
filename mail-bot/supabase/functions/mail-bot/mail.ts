@@ -1471,3 +1471,35 @@ export function draftKeyboard(kind: 'r' | 'n', key: string, polished: boolean, r
   if (!replyAll) return { inline_keyboard: [polished ? [send, ai, cancel] : [ai, send, cancel]] }
   return { inline_keyboard: [[send, { text: '👥 Reply all', callback_data: 'Y:' + key }], [ai, cancel]] }
 }
+
+// ------------------------------------------------------------ gmail health --
+
+/**
+ * A Gmail error worth one more try a moment later: Google being busy (429),
+ * a server error (5xx), or "Precondition check failed" (400
+ * failedPrecondition), which Gmail sometimes answers for a second and then
+ * not again. Real refusals (no access, not found, a bad request) are not.
+ */
+export function isGmailHiccup(status: number, detail: string): boolean {
+  return status === 429 || status >= 500 || (status === 400 && /failedPrecondition|precondition check failed/i.test(detail))
+}
+
+/** How long an inbox must keep failing before you are told: shorter blips fix themselves and lose nothing. */
+export const ALERT_AFTER_MS = 10 * 60_000
+
+/** Whether to tell you now that an inbox can't be checked: it has failed for 10 minutes and you weren't told yet. */
+export function inboxAlert(failingSince: Date | null, alertedAt: Date | null, now: Date): boolean {
+  if (!failingSince || alertedAt) return false
+  return now.getTime() - failingSince.getTime() >= ALERT_AFTER_MS
+}
+
+/** The warning, in plain words: no raw error text. */
+export function alertText(inbox: string, minutes: number): string {
+  return '⚠️ I can\'t reach Gmail for <b>' + esc(inbox) + '</b> (' + minutes + ' minutes now). I keep trying every ' +
+    'minute. No email is lost: they come here as soon as it works again. /status shows it.'
+}
+
+/** After the warning, when it works again. */
+export function recoveredText(inbox: string): string {
+  return '✅ Gmail works again for <b>' + esc(inbox) + '</b>. Nothing was lost: what came meanwhile is here now.'
+}

@@ -48,6 +48,10 @@ import {
   TYPE_PREFIX,
   conversationOf,
   URGENT_WORDS,
+  alertText,
+  inboxAlert,
+  isGmailHiccup,
+  recoveredText,
   type Attachment,
   type Button,
   type Day,
@@ -118,6 +122,7 @@ const LOCK_MS = 3 * 60_000
 const TG_TIMEOUT_MS = 20_000
 const TG_FILE_TIMEOUT_MS = 120_000
 const GMAIL_TIMEOUT_MS = 30_000
+const GMAIL_RETRY_MS = 2_000
 const MAX_ATTACHMENTS = 10
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 const EXPIRY_MARGIN_MS = 60_000
@@ -180,6 +185,9 @@ interface Inbox {
   /** The Gmail label id of the tag ("erbol") in this inbox, and when it was last looked up. */
   tag_label_id: string | null
   tag_checked_at: string | null
+  /** When checking this inbox started failing (null while it works), and when you were told. */
+  failing_since: string | null
+  alerted_at: string | null
 }
 
 /** A row of mailbot_reminders: something to send at `due_at`. */
@@ -461,17 +469,39 @@ async function accessToken(ib: Inbox, chat?: string): Promise<string> {
 // deno-lint-ignore no-explicit-any
 async function gmail(ib: Inbox, path: string, body?: unknown, chat?: string): Promise<any> {
   const token = await accessToken(ib, chat)
-  const res = await fetch(GMAIL + path, {
-    method: body ? 'POST' : 'GET',
-    headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(GMAIL_TIMEOUT_MS),
-  })
-  if (!res.ok) {
-    const detail = (await res.text()).slice(0, 300)
-    throw new GmailError(res.status, `Gmail ${path.split('?')[0]}: ${res.status} ${detail}`)
+  // A read is tried once more after a Google hiccup (busy, a 5xx, "Precondition check failed", a dropped
+  // connection), so a one-second problem on Google's side never reaches you. A write (send, archive) is
+  // never repeated: an email must not go out twice. A timeout isn't repeated either, so a check never
+  // waits twice as long.
+  const read = !body
+  for (let attempt = 0; ; attempt++) {
+    let res: Response
+    try {
+      res = await fetch(GMAIL + path, {
+        method: body ? 'POST' : 'GET',
+        headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(GMAIL_TIMEOUT_MS),
+      })
+    } catch (e) {
+      const timedOut = e instanceof DOMException && e.name === 'TimeoutError'
+      if (read && attempt === 0 && !timedOut) {
+        await sleep(GMAIL_RETRY_MS)
+        continue
+      }
+      throw e
+    }
+    if (!res.ok) {
+      const detail = (await res.text()).slice(0, 300)
+      if (read && attempt === 0 && isGmailHiccup(res.status, detail)) {
+        console.error('gmail hiccup, trying again', path.split('?')[0], res.status)
+        await sleep(GMAIL_RETRY_MS)
+        continue
+      }
+      throw new GmailError(res.status, `Gmail ${path.split('?')[0]}: ${res.status} ${detail}`)
+    }
+    return res.status === 204 ? {} : await res.json()
   }
-  return res.status === 204 ? {} : await res.json()
 }
 
 async function fetchEmail(ib: Inbox, id: string): Promise<Email> {
@@ -489,13 +519,22 @@ async function pollAll(cfg: Config): Promise<number> {
       return await pollInbox(ib, chat, ctx)
     } catch (e) {
       console.error('poll', ib.email, e)
-      const message = errorText(e).slice(0, 500)
-      await db.from('mailbot_inboxes').update({ last_error: message, last_checked_at: new Date().toISOString() })
-        .eq('id', ib.id)
-      // Told once when an inbox starts failing; /status shows it until it recovers.
-      if (!ib.last_error && ib.status === 'connected') {
-        await send(chat, '⚠️ Couldn\'t check <b>' + esc(ib.email) + '</b>: ' + esc(message), TRASH)
+      const now = new Date()
+      const since = ib.failing_since ? new Date(ib.failing_since) : now
+      const update: Record<string, unknown> = {
+        last_error: errorText(e).slice(0, 500),
+        last_checked_at: now.toISOString(),
+        failing_since: since.toISOString(),
       }
+      // Told only after 10 minutes of failures, once, in plain words and without sound at night. Google's
+      // one-minute hiccups ("Precondition check failed", a slow answer) fix themselves and lose nothing:
+      // the bookmark stays, so the next good check brings everything. /status shows it meanwhile.
+      if (ib.status === 'connected' && inboxAlert(since, ib.alerted_at ? new Date(ib.alerted_at) : null, now)) {
+        const minutes = Math.round((now.getTime() - since.getTime()) / 60_000)
+        await send(chat, alertText(ib.email, minutes), TRASH, undefined, isQuiet(now, ctx.tz, ctx.quiet))
+        update.alerted_at = now.toISOString()
+      }
+      await db.from('mailbot_inboxes').update(update).eq('id', ib.id)
       return 0
     }
   }))
@@ -533,8 +572,14 @@ async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
   if (ib.label === null) await rememberInboxName(ib)
   if (!ib.history_id) {
     const profile = await gmail(ib, 'profile', undefined, chat)
-    await db.from('mailbot_inboxes').update({ history_id: String(profile.historyId), last_checked_at: now, last_error: null })
-      .eq('id', ib.id)
+    await backToNormal(ib, chat, ctx)
+    await db.from('mailbot_inboxes').update({
+      history_id: String(profile.historyId),
+      last_checked_at: now,
+      last_error: null,
+      failing_since: null,
+      alerted_at: null,
+    }).eq('id', ib.id)
     return 0
   }
 
@@ -595,10 +640,18 @@ async function pollInbox(ib: Inbox, chat: string, ctx: Ctx): Promise<number> {
 
   // A cut-short or failed run keeps the cursor, so the rest comes next minute;
   // mailbot_seen skips whatever was already handled.
-  const update: Record<string, unknown> = { last_checked_at: now, last_error: null }
+  await backToNormal(ib, chat, ctx)
+  const update: Record<string, unknown> = { last_checked_at: now, last_error: null, failing_since: null, alerted_at: null }
   if (finished) update.history_id = latest
   await db.from('mailbot_inboxes').update(update).eq('id', ib.id)
   return posted
+}
+
+/** After a "can't reach Gmail" warning: say it works again. Nothing was lost, so that's all there is to say. */
+async function backToNormal(ib: Inbox, chat: string, ctx: Ctx): Promise<void> {
+  if (!ib.alerted_at) return
+  await send(chat, recoveredText(ib.email), TRASH, undefined, isQuiet(new Date(), ctx.tz, ctx.quiet))
+  ib.alerted_at = null
 }
 
 /** Which of these keys mailbot_seen already has. A failed read stops the check rather than post everything again. */

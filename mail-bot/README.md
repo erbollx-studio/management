@@ -268,6 +268,16 @@ deno test mail-bot/test/
 
 ## Never losing an email
 
+- **Google's short hiccups don't reach you.** A Gmail read that fails with a
+  temporary error (busy, a server error, or "Precondition check failed") is
+  tried once more after 2 seconds. Sends and archives are never repeated, so
+  an email can't go out twice.
+- **"⚠️ I can't reach Gmail" only after 10 minutes** of failures in a row, once,
+  in plain words and without sound at night; then "✅ Gmail works again" when
+  it recovers (`failing_since`, `alerted_at` in `mailbot_inboxes`). On 5 Nov one
+  such one-minute Google error sent a raw error message at night; that can't
+  happen now. /status still shows a failing inbox right away.
+
 - An email is marked as handled only after it reached the chat (or the daily
   list). If Telegram or Gmail fails, the bot keeps its place in Gmail and tries
   that email again the next minute.

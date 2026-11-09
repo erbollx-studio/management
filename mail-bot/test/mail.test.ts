@@ -52,6 +52,10 @@ import {
   learnedType,
   TYPE_PREFIX,
   typeKey,
+  alertText,
+  inboxAlert,
+  isGmailHiccup,
+  recoveredText,
 } from '../supabase/functions/mail-bot/mail.ts'
 
 const b64 = (s: string, charset = 'utf-8') => {
@@ -826,4 +830,30 @@ Deno.test('replies to follow: the conversation is tagged or starred, though the 
   const plain = { messages: [{ labelIds: ['SENT'] }, { labelIds: ['INBOX'] }] }
   assert.deepEqual(conversationOf(plain, 'Label_1'), { tagged: false, starred: false })
   assert.deepEqual(conversationOf({}, 'Label_1'), { tagged: false, starred: false })
+})
+
+Deno.test('Gmail hiccups are tried again; real refusals are not', () => {
+  const precondition = '{"error":{"code":400,"message":"Precondition check failed.","errors":[{"reason":"failedPrecondition"}]}}'
+  assert.ok(isGmailHiccup(400, precondition)) // the 5 Nov one-minute blip on erbolllx@gmail.com
+  assert.ok(isGmailHiccup(500, 'backend error'))
+  assert.ok(isGmailHiccup(503, ''))
+  assert.ok(isGmailHiccup(429, 'rate limit'))
+  assert.ok(!isGmailHiccup(400, '{"error":{"message":"Invalid label"}}'))
+  assert.ok(!isGmailHiccup(401, 'invalid credentials'))
+  assert.ok(!isGmailHiccup(403, 'insufficient permissions'))
+  assert.ok(!isGmailHiccup(404, 'not found'))
+})
+
+Deno.test('inbox alerts: only after 10 minutes of failures, once', () => {
+  const now = new Date(Date.UTC(2026, 10, 5, 18, 41))
+  const ago = (min: number) => new Date(now.getTime() - min * 60_000)
+  assert.equal(inboxAlert(null, null, now), false) // working
+  assert.equal(inboxAlert(now, null, now), false) // the first failed minute: a blip, say nothing
+  assert.equal(inboxAlert(ago(9), null, now), false)
+  assert.equal(inboxAlert(ago(10), null, now), true)
+  assert.equal(inboxAlert(ago(30), ago(20), now), false) // told once already
+  assert.equal(alertText('a<b>@x.com', 12),
+    '⚠️ I can\'t reach Gmail for <b>a&lt;b&gt;@x.com</b> (12 minutes now). I keep trying every minute. ' +
+    'No email is lost: they come here as soon as it works again. /status shows it.')
+  assert.match(recoveredText('info@samexpress.com'), /^✅ Gmail works again for <b>info@samexpress\.com<\/b>/)
 })
