@@ -1018,7 +1018,10 @@ export function cardText(o: {
     ...(o.label ? ['<b>' + esc(o.label) + '</b>'] : []),
     '<b>From:</b> ' + who(email.from.name, email.from.email),
     '<b>To:</b> ' + who(o.inbox.name, o.inbox.email),
-    '<b>Subject:</b> <a href="' + esc(o.link) + '">' + esc(clip(email.subject || '(no subject)', 300)) + '</a>',
+    // The subject is <code>, so a tap copies it. The word "Subject" carries the Gmail link: it opens the
+    // email, and the reply flow reads it back to know which email a swiped reply answers.
+    '<a href="' + esc(o.link) + '"><b>Subject:</b></a> <code>' + esc(clip(email.subject || '(no subject)', 300)) +
+      '</code>',
     ...(o.due ? [esc(o.due)] : []),
   ]
   if (o.details) {

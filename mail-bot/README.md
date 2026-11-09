@@ -105,7 +105,8 @@ Your premium of $1,850 was due Oct 30. Coverage will be cancelled on …
 [▾ More] [↩ Reply] [⏰] [🗑] [🔕]
 ```
 
-The subject links to the email in Gmail. The inbox name comes from Gmail.
+Tap the subject to copy it. The word **Subject:** opens the email in Gmail. The
+inbox name comes from Gmail.
 
 - **▾ More** opens the rest in the same message: the time, the words that
   chose the template, and more of the text. **▴ Less** folds it back.

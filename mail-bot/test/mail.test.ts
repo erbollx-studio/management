@@ -195,7 +195,7 @@ Deno.test('the card: template, From and To with names, subject linked to Gmail, 
     '<b>🧾 Invoice / payment</b>',
     '<b>From:</b> Heather G · heatherg@aladdincap.com',
     '<b>To:</b> Jolgo · info@jolgo.app',
-    '<b>Subject:</b> <a href="' + link + '">FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</a>',
+    '<a href="' + link + '"><b>Subject:</b></a> <code>FactorGenie System &amp; TMS Integration &lt;MC#1355817&gt;</code>',
     'Hi Erbol, FTP details attached.',
   ].join('\n'))
   assert.deepEqual(refFromEntities([{ type: 'text_link', url: link }]), { inbox: 'info@jolgo.app', id: e.id })
@@ -227,7 +227,7 @@ Deno.test('▾ More adds time, the words that chose the template and the text, a
     label: '🧾 Invoice / payment', inbox: { email: 'info@jolgo.app', name: '' }, email: e, link: 'x',
     timeZone: 'Asia/Bishkek', details: true, tags: ['invoice'], body: readableBody(e, true),
   })
-  assert.ok(t.endsWith('</a>\n🕐 26 Oct, 14:32 · 🏷 invoice\n\nHi Erbol,\n\nFTP details attached.'), t)
+  assert.ok(t.endsWith('</code>\n🕐 26 Oct, 14:32 · 🏷 invoice\n\nHi Erbol,\n\nFTP details attached.'), t)
 })
 
 // Templates on a trucking inbox: [subject, body, sender, files, expected top line or '' = daily list].
@@ -771,7 +771,7 @@ Deno.test('deadline line, calendar link and buttons', () => {
   const e = plain('Renewal', 'Hello')
   const t = cardText({ label: '💰 Insurance payment', email: e, inbox: { email: 'a@b.com', name: '' }, link: 'L',
     timeZone: TZ, body: 'Hello', due: '📅 Due Tue 10 Nov (in 7 days)' })
-  assert.deepEqual(t.split('\n').slice(3), ['<b>Subject:</b> <a href="L">Renewal</a>', '📅 Due Tue 10 Nov (in 7 days)', 'Hello'])
+  assert.deepEqual(t.split('\n').slice(3), ['<a href="L"><b>Subject:</b></a> <code>Renewal</code>', '📅 Due Tue 10 Nov (in 7 days)', 'Hello'])
 })
 
 // ------------------------------------------------------- nobody answered --
